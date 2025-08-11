@@ -1,0 +1,209 @@
+// Copyright 2014 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Inspired by the game "2048" by Gabrielle Cirulli.
+// http://gabrielecirulli.github.io/2048/
+
+def T: Vt100;
+def stdin = 0;
+def hexMap = "0123456789ABCDEF";
+
+class Board {
+	def SIZE = 4;
+	def board = Array<Array<byte>>.new(SIZE);
+	var score = 0;
+	var moved: bool;
+	new() {
+		for (i < SIZE) board[i] = Array<byte>.new(SIZE);
+	}
+	def move(tx: int, ty: int, xi: int, yi: int) {
+		var fx = tx + xi, fy = ty + yi;
+		while (fx >= 0 && fx < SIZE && fy >= 0 && fy < SIZE) {
+			var F = board[fx][fy];
+			var T = board[tx][ty];
+			if (F == 0) {
+				// do nothing.
+			} else if (T == 0) {
+				board[tx][ty] = F;
+				board[fx][fy] = 0;
+				moved = true;
+			} else if (T == F) {
+				board[tx][ty] = byte.!(T + 1);
+				board[fx][fy] = 0;
+				score++;
+				moved = true;
+				tx = tx + xi;
+				ty = ty + yi;
+			} else {
+				tx = tx + xi;
+				ty = ty + yi;
+				if (tx != fx || ty != fy) continue;
+			}
+			fx = fx + xi;
+			fy = fy + yi;
+		}
+	}
+	def moveLeft()  { for (i < SIZE) move(i, 0, 0, 1); }
+	def moveRight() { for (i < SIZE) move(i, SIZE-1, 0, -1); }
+	def moveUp()    { for (i < SIZE) move(0, i, 1, 0); }
+	def moveDown()  { for (i < SIZE) move(SIZE-1, i, -1, 0); }
+	def stuck() -> bool {
+		for (i < SIZE) {
+			for (j < SIZE) {
+				var x = board[i][j];
+				if (x == 0) return false;
+				if ((i+1) < SIZE && x == board[i+1][j]) return false;
+				if ((j+1) < SIZE && x == board[i][j+1]) return false;
+			}
+		}
+		return true;
+	}
+	def spawn() {
+		var count = 0;
+		for (row in board) for (s in row) if (s == 0) count++;
+		var rand = Random.random(count);
+		for (i < SIZE) for (j < SIZE) {
+			if (board[i][j] == 0 && rand-- == 0) {
+				var num: byte = if(Random.random(10) == 0, 2, 1);
+				board[i][j] = num;
+				return;
+			}
+		}
+		
+	}
+	def draw() {
+		for (x < SIZE) for (y < SIZE) drawTile(x, y);
+		T.moveCursor(SIZE * 3 + 3 , 1);
+		T.fgNorm();
+		T.puts(" Score: ");
+		T.puti(score);
+		T.putc(' ');
+	}
+	def drawTile(x: int, y: int) {
+		var v = board[x][y], line = 2 + x * 3, col = 2 + y * 5;
+		if (v == 0) {
+			T.fgNorm();
+			for (i < 3) {
+				T.moveCursor(i + line, col);
+				T.puts("     ");
+			}
+			return;
+		}
+		T.fgNorm();
+		setFgColor(v);
+		T.drawBox(line, col, 3, 1);
+		if (v > 6) setBgColor(v);
+		T.moveCursor(1 + line, col + 1);
+		var buf = " . ";
+		buf[1] = hexMap[v];
+		T.puts(buf);
+	}
+	def setBgColor(v: byte) {
+		match (v) {
+			2 =>  { T.bgGreen(); }
+			3 =>  { T.bgBlue(); }
+			4 =>  { T.bgMagenta(); }
+			5 =>  { T.bgYellow(); }
+			6 =>  { T.bgRed(); }
+			7 =>  { T.bgGreen(); }
+			8 =>  { T.bgBlue(); }
+			9 =>  { T.bgMagenta(); }
+			10 => { T.bgYellow(); }
+			11 => { T.bgRed(); }
+		} else {
+			T.fgNorm();
+		}
+	}
+	def setFgColor(v: byte) {
+		T.fgNorm();
+		match (v) {
+			1 =>  { T.fgLightGray(); }
+			2 =>  { T.fgBrightGreen(); }
+			3 =>  { T.fgBrightBlue(); }
+			4 =>  { T.fgMagenta(); }
+			5 =>  { T.fgYellow(); }
+			6 =>  { T.fgBrightRed(); }
+			7 =>  { T.fgBrightGreen(); }
+			8 =>  { T.fgBrightBlue(); }
+			9 =>  { T.fgMagenta(); }
+			10 => { T.fgYellow(); }
+			11 => { T.fgBrightRed(); }
+		} else {
+			T.fgNorm();
+		}
+	}
+	def drawBorder() {
+		var innerWidth = 5 * SIZE, innerHeight = 3 * SIZE;
+		T.drawBox(1, 1, innerWidth, innerHeight);
+		var title = "2048";
+		T.moveCursor(1, 1 + (innerWidth + 4 - title.length) / 2 - 2);
+		T.putc(' ');
+		T.puts(title);
+		T.putc(' ');
+		T.moveCursor(innerHeight + 3, 1);
+	}
+}
+
+
+def main(args: Array<string>) -> int {
+	T.eraseScreen();
+	var oldstate = raw_mode(stdin);
+	var buffer = Array<byte>.new(16), which = 0;
+	var board = Board.new();
+	board.drawBorder();
+	board.spawn();
+	board.draw();
+	Random.seed = System.ticksUs();
+	while (true) {
+		if (board.stuck()) break;
+		for (i < buffer.length - 1) buffer[i] = buffer[i + 1];
+		var b = System.fileRead(stdin);
+		if (b < 0) break;
+		var ch = buffer[buffer.length - 1] = byte.!(b);
+		board.moved = false;
+		match (ch) {
+			'j' => board.moveLeft();
+			'k' => board.moveDown();
+			'l' => board.moveRight();
+			'i' => board.moveUp();
+			'\x03', 'q' => break;
+		}
+		if (board.moved) {
+			board.spawn();
+			board.draw();
+		}
+	}
+	restore(stdin, oldstate);
+//	T.moveCursor(board.SIZE * 3 + 4, 2);
+	T.puts(" stuck!\n");
+	return 0;
+}
+
+// OS-specific IOCTL call to set terminal in raw (non-cooked) mode,
+// so that we can get keypresses as they happen.
+def TIOCGETP = 0x40067408;
+def TIOCSETP = 0x80067409;
+def RAW      = 0x00000020;
+def ECHO     = 0x00000008;
+def SYS_ioctl = 54;
+
+def raw_mode(fd: int) -> Array<u16> {
+	def oldstate = Array<u16>.new(3);
+	Darwin.syscall(SYS_ioctl, (fd, TIOCGETP, Pointer.atContents(oldstate)));
+
+	var newstate = Array<u16>.new(3);
+	newstate[0] = oldstate[0];
+	newstate[1] = oldstate[1];
+	newstate[2] = oldstate[2];
+
+	newstate[2] = u16.!((newstate[2] | RAW) & (-1 ^ ECHO));
+
+	Darwin.syscall(SYS_ioctl, (fd, TIOCSETP, Pointer.atContents(newstate)));
+
+	return oldstate;
+}
+
+def restore(fd: int, termstate: Array<u16>) {
+	Darwin.syscall(SYS_ioctl, (fd, TIOCSETP, Pointer.atContents(termstate)));
+}
+

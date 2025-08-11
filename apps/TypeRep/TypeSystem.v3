@@ -1,0 +1,621 @@
+// Copyright 2020 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Relations between types.
+component TypeSystem {
+	// Returns {true} if {src} is a strict subtype of {dst}, meaning that {src != dst}
+	// and every value of type {src} can be used without representation where {dst} is
+	// expected.
+	def isSubtype(src: Type, dst: Type) -> bool {
+		// aliases types are subtypes of the type they are declared to be an alias of.
+		if (AliasType.?(src)) {
+			var alias = AliasType.!(src).alias;
+			return alias == dst || isSubtype(alias, dst);
+		}
+
+		match (dst) {
+			y: ClassType => {
+				// check subtyping of classes by searching up the inheritance tree.
+				match (src) {
+					x: NullType => return true;
+					x: ClassType => return walkUpTo(x, y) == y;
+					_ => return false;
+				}
+			}
+			y: VariantType => {
+				// check a variant case against its supertype.
+				match (src) {
+					x: VariantCaseType => return x.superType == y;
+					_ => return false;
+				}
+			}
+			y: ArrayType => {
+				// the only subtype of a writable array type is null.
+				if (NullType.?(src)) return true;
+				if (y.writable) return false;
+				match (src) { // co-variant non-writeable arrays
+					x: ArrayType => return !x.writable && isSubtype(x.elemType, y.elemType);
+					_ => return false;
+				}
+			}
+			y: RangeType => {
+				if (NullType.?(src)) return true;
+				if (y.writable) return false;
+				match (src) { // co-variant non-writeable ranges
+					x: RangeType => return !x.writable && isSubtype(x.elemType, y.elemType);
+					_ => return false;
+				}
+			}
+			y: SeqType => {
+				match (src) { // co-variant immutable sequences
+					x: SeqType => return isSubtype(x.elemType, y.elemType);
+					_ => return false;
+				}
+			}
+			y: TupleType => {
+				// tuples are co-variantly typed.
+				match (src) {
+					x: TupleType => return isSubtypeArray(x.elemTypes, y.elemTypes);
+					_ => return false;
+				}
+			}
+			y: ClosureType => {
+				// closures are co-variant in return and contra-variant in params
+				match (src) {
+					x: NullType => return true;
+					x: ClosureType => return isSigSubtype(x.sig, y.sig);
+					_ => return false;
+				}
+			}
+			y: FuncType => {
+				// functions are co-variant in return and contra-variant in params
+				match (src) {
+					x: NullType => return true;
+					x: FuncType => return isSigSubtype(x.sig, y.sig);
+					_ => return false;
+				}
+			}
+		}
+		return false;
+	}
+	private def isSigSubtype(s1: Signature, s2: Signature) -> bool {
+		return isSubtypeArray(s1.results, s2.results) && isSubtypeArray(s2.params, s1.params);
+	}
+	private def isSubtypeArray = Arrays.allTrue(_, _, isSubtype);
+
+	// Returns {true} if {src} is promotable to {dst}, meaning that every value
+	// can be converted (with representation change) to type {dst} without any loss of
+	// information.
+	def isPromotable(src: Type, dst: Type) -> bool {
+		match (src) {
+			x: IntType => match (dst) {
+				y: IntType => return isPromotableIntInt(x, y);
+				y: FloatType => return isPromotableIntFloat(x, y);
+			}
+			x: FloatType => match (dst) {
+				y: FloatType => return isPromotableFloatFloat(x, y);
+			}
+			x: ArrayType => match (dst) {
+				y: RangeType => {
+					if (y.writable) return x.writable && x.elemType == y.elemType;
+					return isSubtype(x.elemType, y.elemType);
+				}
+			}
+			x: SeqType => match (dst) {
+				y: RangeType => return !y.writable && isSubtype(x.elemType, y.elemType);
+			}
+			x: TupleType => match (dst) {
+				y: TupleType => return Arrays.allTrue(x.elemTypes, y.elemTypes, isPromotable);
+			}
+			x: EnumType => match (dst) {
+				y: EnumSetType => return x.decl == y.decl;
+			}
+		}
+		return false;
+	}
+	def isPromotableIntInt(x: IntType, y: IntType) -> bool {
+		if (x.width > y.width) return false;
+		if (x.width == y.width) return x.signed == y.signed;
+		return y.signed || x.signed == y.signed;
+	}
+	def isPromotableIntFloat(x: IntType, y: FloatType) -> bool {
+		if (x.signed) return x.width <= y.fraction_width;
+		else return x.width <= 1 + y.fraction_width;
+	}
+	def isPromotableFloatFloat(x: FloatType, y: FloatType) -> bool {
+		return x.total_width <= y.total_width;
+	}
+
+	// Returns {true} if every value of type {src} can be assigned to {dst}, either
+	// through subsumption or promotion.
+	def isAssignable(src: Type, dst: Type) -> bool {
+		return src == dst || isSubtype(src, dst) || isPromotable(src, dst);
+	}
+
+	// Compute the common superclass of {x} and {y}, if it exists, walking up the
+	// inheritance hierarchy in lock-step fashion until the same declaration is met.
+	def commonSuperClass(x: ClassType, y: ClassType) -> (ClassType, ClassType) {
+		x = walkUpTo(x, y);
+		y = walkUpTo(y, x);
+		while (x != null) {
+			if (x.decl == y.decl) return (x, y);
+			x = x.getSuperType();
+			y = y.getSuperType();
+		}
+		return (null, null);
+	}
+	def walkUpTo(x: ClassType, y: ClassType) -> ClassType {
+		while (x.depth > y.depth) x = x.getSuperType();
+		return x;
+	}
+
+	// Returns {true} if there is some assignment of types to type parameters such
+	// that {x} and {y} are exactly equivalent types.
+	def maybeEqual(a: Type, b: Type) -> bool {
+		if (a == b) return true;
+		if (((a.hash | b.hash) & TypeHash.POLY_MASK) == 0) return false;
+		match (a) {
+			x: ArrayType => match (b) {
+				y: ArrayType => return x.writable == y.writable && maybeEqual(x.elemType, y.elemType);
+			}
+			x: RangeType => match (b) {
+				y: RangeType => return x.writable == y.writable && maybeEqual(x.elemType, y.elemType);
+			}
+			x: ClassType => match (b) {
+				y: ClassType => return x.decl == y.decl && maybeEqualA(x.typeArgs, y.typeArgs);
+			}
+			x: VariantType => match (b) {
+				y: VariantType => return x.decl == y.decl && maybeEqualA(x.typeArgs, y.typeArgs);
+			}
+			x: VariantCaseType => match (b) {
+				y: VariantCaseType => return x.decl == y.decl && maybeEqual(x.superType, y.superType);
+			}
+			x: DataType => match (b) {
+				y: DataType => return x.decl == y.decl && maybeEqualA(x.typeArgs, y.typeArgs);
+			}
+			x: ClosureType => match (b) {
+				y: ClosureType => return maybeEqualA(x.sig.params, y.sig.params) && maybeEqualA(x.sig.results, y.sig.results);
+			}
+			x: FuncType => match (b) {
+				y: FuncType => return maybeEqualA(x.sig.params, y.sig.params) && maybeEqualA(x.sig.results, y.sig.results);
+			}
+			x: TupleType => match(b) {
+				y: TupleType => return maybeEqualA(x.elemTypes, y.elemTypes);
+			}
+			x: TypeVarType => return true;
+			x: TypeParamType => return true;
+		}
+		match (b) {
+			y: TypeVarType => return true;
+			y: TypeParamType => return true;
+			_ => return false;
+		}
+	}
+	def maybeEqualA = Arrays.allTrue(_, _, maybeEqual);
+
+	// Return {true} if {t} is a reference type.
+	def isRefType(t: Type) -> bool {
+		match (t) {
+			x: ClassType => return true;
+			x: ArrayType => return true;
+			x: ClosureType => return true;
+			_ => return false;
+		}
+	}
+
+	// Unify two types {a} and {b} (adjusting the solution to any type variables that may
+	// appear in {a}) and return a type that both {a} and {b} are assignable to, if such
+	// a type exists. Type variables in {b} are ignored.
+	def unifyWiden(a: Type, b: Type) -> Type {
+		return unify(a, b, UnifyMode.PROMOTE);
+	}
+
+	// Guts of recursive unification.
+	private def unify(a: Type, b: Type, mode: UnifyMode) -> Type {
+		if (a == b) return a;
+
+		match (a) {
+			x: IntType => if (mode == UnifyMode.PROMOTE) {
+				if (isPromotable(x, b)) return b;
+				if (isPromotable(b, x)) return x;
+			}
+			x: FloatType => if (mode == UnifyMode.PROMOTE) {
+				if (isPromotable(x, b)) return b;
+				if (isPromotable(b, x)) return x;
+			}
+			x: ArrayType => match (b) {
+				y: ArrayType => return unifyIndexType(x, y, mode);
+				y: RangeType => return unifyArrayRangeTypes(x, y, mode);
+				y: NullType => if (x.writable) return unifyRefNull(x, mode);
+			}
+			x: RangeType => match (b) {
+				y: ArrayType => return unifyArrayRangeTypes(y, x, reverseUnifyMode(mode));
+				y: RangeType => return unifyIndexType(x, y, mode);
+			}
+			x: ClassType => match (b) {
+				y: ClassType => match (mode) {
+					UP, PROMOTE => {
+						return unifySuperClasses(x, y);
+					}
+					EQUAL => {
+						var u = unifySuperClasses(x, y);
+						if (u == null) return null;
+						return if(u.decl == x.decl && u.decl == y.decl, u);
+					}
+					DOWN => {
+						var u = unifySuperClasses(x, y);
+						if (u == null) return null;
+						return if(x.depth > y.depth, x, y);
+					}
+				}
+				y: NullType => return unifyRefNull(x, mode);
+			}
+			x: VariantType => match (b) {
+				y: VariantType => {
+					return unifyVariants(x, y);
+				}
+				y: VariantCaseType => {
+					return unifyVariantCases(y.decl, x, y.superType, mode);
+				}
+			}
+			x: VariantCaseType => match (b) {
+				y: VariantType => {
+					return unifyVariantCases(x.decl, x.superType, y, mode);
+				}
+				y: VariantCaseType => {
+					var u = unifyVariants(x.superType, y.superType);
+					if (u == null) return null;
+					if (x.decl == y.decl) return u.getCase(x.decl);
+					match (mode) {
+						UP, PROMOTE => return u;
+						_ => return null;
+					}
+				}
+			}
+			x: DataType => match(b) {
+				y: DataType => {
+					if (x.decl != y.decl) return null;
+					var typeArgs = unifyArray(x.typeArgs, y.typeArgs, mode);
+					if (typeArgs == null) return null;
+					return x.decl.getCachedType(typeArgs);
+				}
+			}
+			x: ClosureType => match (b) {
+				y: ClosureType => {
+					var pt = unifyArray(x.sig.params, y.sig.params, reverseUnifyMode(mode));
+					var rt = unifyArray(x.sig.results, y.sig.results, mode);
+					return if(pt != null && rt != null, ClosureTypeCache.get(Signature.new(pt, rt)));
+				}
+				y: NullType => return unifyRefNull(x, mode);
+			}
+			x: FuncType => match (b) {
+				y: FuncType => {
+					var pt = unifyArray(x.sig.params, y.sig.params, reverseUnifyMode(mode));
+					var rt = unifyArray(x.sig.results, y.sig.results, mode);
+					return if(pt != null && rt != null, FuncTypeCache.get(Signature.new(pt, rt)));
+				}
+			}
+			x: TupleType => match(b) {
+				y: TupleType => {
+					var elemTypes = unifyArray(x.elemTypes, y.elemTypes, mode);
+					if (elemTypes == null) return null;
+					return TupleTypeCache.get(elemTypes);
+				}
+			}
+			x: TypeVarType => {
+				var lub = if(x.solution == null, b, unify(x.solution, b, mode));
+				if (lub != null) {
+					x.solution = lub;
+					return x;
+				}
+			}
+			x: NullType => {
+				if(isRefType(b)) return unifyRefNull(b, mode);
+			}
+			// TODO: type aliases
+		}
+		return null;
+	}
+	private def unifyIndexType(x: IndexedType, y: IndexedType, mode: UnifyMode) -> Type {
+		if (x.writable != y.writable) return null;
+		var nmode = if(x.writable, UnifyMode.EQUAL, if(mode == UnifyMode.PROMOTE, UnifyMode.UP, mode));
+		var e = unify(x.elemType, y.elemType, mode);
+		if (e == null) return null;
+		return if(ArrayType.?(x), ArrayTypeCache.get2(x.writable, e), RangeTypeCache.get(x.writable, e));
+	}
+	private def unifyArrayRangeTypes(x: ArrayType, y: RangeType, mode: UnifyMode) -> Type {
+		if (x.writable != y.writable) return null;
+		if (mode != UnifyMode.PROMOTE) return null;
+		if (x.writable) {
+			var e = unify(x.elemType, y.elemType, UnifyMode.EQUAL);
+			return if(e != null, RangeTypeCache.get(true, e));
+		} else {
+			var e = unify(x.elemType, y.elemType, mode);
+			return if(e != null, RangeTypeCache.get(false, e));
+		}
+	}
+	private def unifyRefNull(x: Type, mode: UnifyMode) -> Type {
+		 match (mode) {
+			UP, PROMOTE => return x;
+			EQUAL => return null;
+			DOWN => return GlobalTypeCache.NULL;
+		}
+	}
+	private def unifyArray(at: Array<Type>, bt: Array<Type>, mode: UnifyMode) -> Array<Type> {
+		if (at.length != bt.length) return null;
+		var rt = Array<Type>.new(at.length);
+		for (i < rt.length) {
+			var u = unify(at[i], bt[i], mode);
+			if (u == null) return null;
+			rt[i] = u;
+		}
+		return rt;
+	}
+	private def unifySuperClasses(x: ClassType, y: ClassType) -> ClassType {
+		var t = commonSuperClass(x, y), xx = t.0, yy = t.1;
+		if (xx == null) return null;
+		var typeArgs = unifyArray(xx.typeArgs, yy.typeArgs, UnifyMode.EQUAL);
+		if (typeArgs == null) return null;
+		xx = xx.decl.getCachedType(typeArgs);
+		return if(xx == yy, xx);
+	}
+	private def unifyVariants(x: VariantType, y: VariantType) -> VariantType {
+		if (x.decl != y.decl) return null;
+		var typeArgs = unifyArray(x.typeArgs, y.typeArgs, UnifyMode.EQUAL);
+		if (typeArgs == null) return null;
+		return x.decl.getCachedType(typeArgs);
+	}
+	private def unifyVariantCases(c: VstCaseMember, x: VariantType, y: VariantType, mode: UnifyMode) -> Type {
+		match (mode) {
+			UP, PROMOTE => {
+				return unifyVariants(x, y);
+			}
+			EQUAL => {
+				unifyVariants(x, y);
+				return null;
+			}
+			DOWN => {
+				var u = unifyVariants(x, y);
+				return if (u != null, u.getCase(c));
+			}
+		}
+	}
+	private def reverseUnifyMode(mode: UnifyMode) -> UnifyMode {
+		match (mode) {
+			UP => return UnifyMode.DOWN;
+			DOWN => return UnifyMode.UP;
+			_ => return UnifyMode.EQUAL;
+		}
+	}
+
+	// Get the supertype of a type, if any.
+	def getSuperType(t: Type) -> Type {
+		match (t) {
+			x: ClassType => return x.getSuperType();
+			x: VariantCaseType => return x.superType;
+			_ => return null;
+		}
+	}
+
+	def isPrimitive(t: Type) -> bool {
+		match (t) {
+			x: VoidType => return true;
+			x: BoolType => return true;
+			x: IntType => return true;
+			x: FloatType => return true;
+			x: EnumType => return true;
+			x: EnumSetType => return true;
+			x: AliasType => return isPrimitive(x.alias);
+			// TODO: recursively match primitive tuples?
+			_ => return false;
+		}
+	}
+
+	// Compute the query operation, if it exists, for the expression "dst.?(src)".
+	def newTypeQuery(src: Type, dst: Type, legacy_intcast: bool) -> TypeQuery {
+		if (TypeParamType.?(src)) return TypeQuery.UNKNOWN_QUERY;
+		if (TypeVarType.?(src)) return TypeQuery.UNKNOWN_QUERY;
+
+		var q: TypeQuery = TypeQuery.FALSE;
+		match (dst) {
+			y: IntType => match (src) {
+				x: IntType => {
+					if (isPromotableIntInt(x, y)) return if(legacy_intcast, TypeQuery.FALSE, TypeQuery.TRUE);
+					else return if(legacy_intcast, TypeQuery.FALSE, TypeQuery.INT_QUERY_I);
+				}
+				x: FloatType => return TypeQuery.INT_QUERY_F;
+			}
+			y: FloatType => match (src) {
+				x: FloatType => {
+					return if (isPromotableFloatFloat(x, y), TypeQuery.TRUE, TypeQuery.FLOAT_QUERY_D);
+				}
+				x: IntType => {
+					return if (isPromotableIntFloat(x, y), TypeQuery.TRUE, TypeQuery.FLOAT_QUERY_I);
+				}
+			}
+			y: ClassType => match (src) {
+				x: ClassType => {
+					var xx = walkUpTo(x, y);
+					if (xx == y) return TypeQuery.TRUE_IF_NOT_NULL;
+					if (xx.decl == y.decl && maybeEqualA(xx.typeArgs, y.typeArgs)) return TypeQuery.UNKNOWN_QUERY;
+					var yy = walkUpTo(y, x);
+					if (x == yy) return TypeQuery.CLASS_QUERY;
+					if (x.decl == yy.decl && maybeEqualA(x.typeArgs, yy.typeArgs)) return TypeQuery.UNKNOWN_QUERY;
+					return TypeQuery.FALSE;
+				}
+				_ => return TypeQuery.FALSE;
+			}
+			y: TupleType => match (src) {
+				x: TupleType => return recursiveTupleOp(newTypeQuery, x, y, legacy_intcast,
+					TypeQuery.FALSE, TODO_tuple_query);
+			}
+			y: TypeParamType => q = TypeQuery.UNKNOWN_QUERY;
+			y: TypeVarType => q = TypeQuery.UNKNOWN_QUERY;
+			y: VariantType => match (src) {
+				x: VariantType => return maybeQuery(x, y, TypeQuery.TRUE, TypeQuery.FALSE);
+				x: VariantCaseType => {
+					if (x.superType.decl == y.decl) {
+						return maybeQuery(x.superType, y, TypeQuery.TRUE, TypeQuery.FALSE);
+					}
+				}
+			}
+			y: VariantCaseType => match (src) {
+				x: VariantType => {
+					if (y.superType.decl == y.decl) {
+						return maybeQuery(x, y.superType, TypeQuery.VARIANT_QUERY, TypeQuery.FALSE);
+					}
+				}
+				x: VariantCaseType => {
+					if (x.decl == y.decl) {
+						return maybeQuery(x.superType, y.superType, TypeQuery.TRUE, TypeQuery.FALSE);
+					}
+				}
+			}
+		}
+		return if(isAssignable(src, dst), TypeQuery.TRUE, q);
+	}
+	private def maybeQuery(x: Type, y: Type, t: TypeQuery, f: TypeQuery) -> TypeQuery {
+		if (x == y) return t;
+		if (maybeEqual(x, y)) return TypeQuery.UNKNOWN_QUERY;
+		return f;
+	}
+
+	// Compute the cast operation, if it exists, for the expression "dst.!(src)".
+	def newTypeCast(src: Type, dst: Type, legacy_intcast: bool) -> TypeCast {
+		if (src == dst) return TypeCast.TRUE;
+		// XXX: reduce duplication between newTypeCast() and newTypeQuery: use result enum, tables?
+		if (TypeParamType.?(src)) return TypeCast.UNKNOWN_CAST;
+		if (TypeVarType.?(src)) return TypeCast.UNKNOWN_CAST;
+
+		var subsume: TypeCast = TypeCast.SUBSUME, cast: TypeCast = TypeCast.THROW;
+		match (dst) {
+			y: IntType => match (src) {
+				x: IntType => {
+					if (isPromotableIntInt(x, y)) return TypeCast.INT_PROMOTE_I;
+					return if(legacy_intcast, TypeCast.INT_VIEW_I, TypeCast.INT_CAST_I);
+				}
+				x: FloatType => {
+					return TypeCast.FLOAT_CAST_I;
+				}
+			}
+			y: FloatType => match (src) {
+				x: FloatType => {
+					if (isPromotableFloatFloat(x, y)) return TypeCast.FLOAT_PROMOTE_F;
+					return TypeCast.FLOAT_CAST_D;
+				}
+				x: IntType => {
+					if (isPromotableIntFloat(x, y)) return TypeCast.FLOAT_PROMOTE_I;
+					return TypeCast.INT_CAST_F;
+				}
+			}
+			y: ArrayType => match (src) {
+				x: ArrayType => return if(maybeEqual(x.elemType, y.elemType), TypeCast.UNKNOWN_CAST, TypeCast.THROW);
+				x: NullType => return TypeCast.SUBSUME;
+			}
+			y: ClassType => match (src) {
+				x: ClassType => {
+					var xx = walkUpTo(x, y);
+					if (xx == y) return TypeCast.SUBSUME;
+					if (xx.decl == y.decl && maybeEqualA(xx.typeArgs, y.typeArgs)) return TypeCast.UNKNOWN_CAST;
+					var yy = walkUpTo(y, x);
+					if (x == yy) return TypeCast.CLASS_CAST;
+					if (x.decl == yy.decl && maybeEqualA(x.typeArgs, yy.typeArgs)) return TypeCast.UNKNOWN_CAST;
+					return TypeCast.THROW_IF_NOT_NULL;
+				}
+				x: NullType => return TypeCast.SUBSUME;
+			}
+			y: TupleType => match (src) {
+				x: TupleType => return recursiveTupleOp(newTypeCast, x, y, legacy_intcast,
+					TypeCast.THROW, TODO_tuple_cast);
+			}
+			y: TypeParamType => cast = TypeCast.UNKNOWN_CAST;
+			y: TypeVarType => cast = TypeCast.UNKNOWN_CAST;
+			y: VariantType => match (src) {
+				x: VariantType => return maybeCast(x, y, TypeCast.TRUE, TypeCast.THROW);
+				x: VariantCaseType => {
+					if (x.superType.decl == y.decl) {
+						return maybeCast(x.superType, y, TypeCast.SUBSUME, TypeCast.THROW);
+					}
+				}
+			}
+			y: VariantCaseType => match (src) {
+				x: VariantType => {
+					if (y.superType.decl == y.decl) {
+						return maybeCast(x, y.superType, TypeCast.VARIANT_CAST, TypeCast.THROW);
+					}
+				}
+				x: VariantCaseType => {
+					if (x.decl == y.decl) {
+						return maybeCast(x.superType, y.superType, TypeCast.SUBSUME, TypeCast.THROW);
+					}
+				}
+			}
+			y: EnumSetType => match (src) {
+				x: EnumType => if (x.decl == y.decl) return TypeCast.ENUM_TO_SET;
+			}
+		}
+		return if(isAssignable(src, dst), subsume, cast);
+	}
+	private def maybeCast(x: Type, y: Type, t: TypeCast, f: TypeCast) -> TypeCast {
+		if (x == y) return t;
+		if (maybeEqual(x, y)) return TypeCast.UNKNOWN_CAST;
+		return f;
+	}
+	private def recursiveTupleOp<T>(f: (Type, Type, bool) -> T, x: TupleType, y: TupleType, legacy_intcast: bool, bad: T, cons: Array<T> -> T) -> T {
+		var xt = x.elemTypes, yt = y.elemTypes;
+		if (xt.length != yt.length) return bad;
+		var qa = Array<T>.new(xt.length);
+		for (i < qa.length) {
+			var n = f(xt[i], yt[i], legacy_intcast);
+			if (n == bad) return bad;
+			qa[i] = n;
+		}
+		return cons(qa);
+	}
+}
+
+enum UnifyMode {
+	UP, PROMOTE, EQUAL, DOWN
+}
+
+// enumeration of the different kinds of type casts
+enum TypeCast {
+	UNKNOWN_CAST,		// involves type variables or type params
+	VOID_CAST,		// cast to void, discard value
+	SUBSUME,		// type subsumption (no-op)
+	TRUE,			// identity cast
+	THROW_IF_NOT_NULL,	// throw if value is not null
+	THROW,			// (promotion) always throw
+	INT_VIEW_I, 		// NEW: reinterpret bits of integer
+	INT_CAST_I,		// NEW: bounds-checked integer conversion
+	INT_PROMOTE_I,		// NEW: (promotion) integer to larger representation
+	FLOAT_CAST_I,		// checked cast float to integer
+	INT_CAST_F,		// checked cast integer to float
+	FLOAT_PROMOTE_F,	// (promotion) float to double
+	FLOAT_PROMOTE_I,	// (promotion) int to float
+	FLOAT_CAST_D,		// checked cast double to float
+	CLASS_CAST,		// checked class cast
+	VARIANT_CAST,		// checked variant cast
+	TUPLE_CAST,		// (recursive) tuple cast
+	ENUM_TO_SET		// (promotion) convert enum to enum set
+}
+// enumeration of the different kinds of type queries
+enum TypeQuery {
+	UNKNOWN_QUERY,		// involes type variables or params
+	TRUE,			// always true
+	TRUE_IF_NOT_NULL,	// true if not null
+	FALSE,			// always false
+	FLOAT_QUERY_I,		// checked query of integer against float range
+	INT_QUERY_F,		// checked query of float against int range
+	INT_QUERY_I,		// NEW: checked query of int against range
+	FLOAT_QUERY_D,		// checked query of double against float range
+	CLASS_QUERY,		// checked class query
+	VARIANT_QUERY,		// checked variant query
+	TUPLE_QUERY		// (recursive) tuple query
+}
+def TODO_tuple_cast(a: Array<TypeCast>) -> TypeCast {
+	return TypeCast.TUPLE_CAST;
+}
+def TODO_tuple_query(a: Array<TypeQuery>) -> TypeQuery {
+	return TypeQuery.TUPLE_QUERY;
+}

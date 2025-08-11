@@ -1,0 +1,391 @@
+// implicit type reg: Reg;
+// implicit type vreg: int;
+// implicit type use: Use;
+// implicit type ref: MiRef;
+
+class MiRef(vreg: int) {
+	var prev: MiRef;
+	var assignment: Loc;
+	var constraint: Reg.set;
+}
+class Def extends MiRef {
+	var overwrite: bool;
+	new(vreg: int) super(vreg) { }
+	def at(r: Reg.set) -> Def { constraint = r; return this; }
+	def is(loc: Loc) -> Def { assignment = loc; return this; }
+}
+class Use extends MiRef {
+	new(vreg: int) super(vreg) { }
+	def at(r: Reg.set) -> Use { constraint = r; return this; }
+	def is(loc: Loc) -> Use { assignment = loc; return this; }
+}
+class Instr(opcode: int, operands: Array<MiRef>) {
+}
+type Loc {
+	case None;		// No location assigned
+	case Reg(reg: Reg);	// Register
+	case Stack(slot: i20);	// < 0 is caller's stack, > 0 is callee's stack
+}
+enum Reg { A, B, C, D }
+def REG_COUNT = byte.!(Reg.D.tag + 1);
+def FREE_LIST: byte = REG_COUNT;
+def NOT_FREE: byte = byte.!(REG_COUNT + 1);
+def REGS = [Reg.A, Reg.B, Reg.C, Reg.D];
+def LOCS: Array<Loc.Reg> = [Loc.Reg(Reg.A), Loc.Reg(Reg.B), Loc.Reg(Reg.C), Loc.Reg(Reg.D)];
+def NONE: Reg.set;
+
+// The main register allocator.
+class Allocator(vregs: int) {
+	def vstack = Array<i20>.new(vregs);			// The stack slot assignment, if any, for each vreg
+	def vprev = Array<(MiRef, int)>.new(vregs);		// The next backward use for each vreg
+	def vnext = Array<(MiRef, int)>.new(vregs);		// The next forward use for each vreg
+	def vassign = Array<Loc>.new(vregs);			// The current register assignment for each vreg
+	def rcontents = Array<(MiRef, int)>.new(REG_COUNT);	// The current contents of the register file
+	var curpos: int;
+	var stack: i20 = 0;
+	var moves: List<(Instr, int)>;
+	def rprevfree = Array<byte>.new(REG_COUNT + 1);
+	def rnextfree = Array<byte>.new(REG_COUNT + 1);
+
+	def allocate(instrs: Array<Instr>) -> Array<Instr> {
+		init();
+		// Allocate registers by walking instructions in reverse order.
+		for (pos = instrs.length - 1; pos >= 0; pos--) {
+			curpos = pos;
+			var i = instrs[pos];
+			var defs = 0, operands = i.operands;
+			for (o in operands) {
+				if (Def.?(o)) {
+					defs++;
+					allocRegForOutput(Def.!(o));
+				} else if (Use.?(o)) {
+					if (defs > 0) { defs = 0; freeDefs(operands); }
+					allocRegForInput(Use.!(o));
+				}
+				printState();
+			}
+			if (defs > 0) {
+				freeDefs(operands);
+				printState();
+			}
+		}
+		if (moves != null) {
+			var len = 0;
+			for (l = moves; l != null; l = l.tail) len++;
+			var ninstrs = Array<Instr>.new(instrs.length + len);
+			var pos = 0, n = moves;
+			for (i < instrs.length) {
+				while (n != null && n.head.1 == i) {
+					ninstrs[pos++] = n.head.0;
+					n = n.tail;
+				}
+				ninstrs[pos++] = instrs[i];
+			}
+			while (n != null) {
+				ninstrs[pos++] = n.head.0;
+				n = n.tail;
+			}
+			instrs = ninstrs;
+		}
+		return instrs;
+	}
+	def freeDefs(operands: Array<MiRef>) {
+		for (o in operands) {
+			if (!Def.?(o)) break;
+			var r = vassign[o.vreg];
+			if (Loc.Reg.?(r)) freeReg(o);
+		}
+	}
+	def allocRegForOutput(d: Def) {
+		// Allocate a register for the definition, if not already allocated.
+		var da = vassign[d.vreg];
+		var dn = vnext[d.vreg];
+		var next = vnext[d.vreg];
+		vnext[d.vreg] = (d, curpos);
+		if (da == Loc.None) {
+			// The virtual register {d.vreg} was spilled between this instruction
+			// and the next use. Allocate a new register and insert a save afterward.
+			var r = allocReg(d, d.constraint);
+			da = r;
+			assignReg(r, d);
+			// Insert a save (somewhere) after this position.
+			if (next.0 != null) save(d, curpos + 1);
+		} else if (d.constraint != NONE) {
+			var reg = Loc.Reg.!(da).reg;
+			if (!(d.constraint >= reg)) {
+				freeReg(d);
+				var r = allocReg(d, d.constraint);
+				da = r;
+				assignReg(r, d);
+				// Insert a move (somewhere) after this position.
+				if (next.0 != null) mov(d.vreg, next.0.assignment, r, next.1);
+			}
+		}
+		d.assignment = da;
+	}
+	def printState() {
+		puts("STATE @");
+		puti(curpos);
+		puts(": ");
+		for (i < rcontents.length) {
+			var p = rcontents[i];
+			if (p.0 == null) continue;
+			puts(" %");
+			puts(LOCS[i].reg.name);
+			puts("=v");
+			puti(p.0.vreg);
+			puts("@");
+			puti(p.1);
+		}
+		puts(", free={");
+		var first = rnextfree[FREE_LIST];
+		for (i = first; i != FREE_LIST; i = rnextfree[i]) {
+			if (i != first) putc(',');
+			puts(REGS[i].name);
+		}
+		puts("}");
+		System.ln();
+	}
+	def allocRegForInput(u: Use) {
+		var ua = vassign[u.vreg];
+		vnext[u.vreg] = (u, curpos);
+		if (ua == Loc.None) ua = allocReg(u, u.constraint);
+		u.assignment = ua;
+		assignReg(Loc.Reg.!(ua), u);
+	}
+	def freeReg(ref: MiRef) {
+		var reg = Loc.Reg.!(vassign[ref.vreg]).reg;
+		vassign[ref.vreg] = Loc.None;
+		rcontents[reg.tag] = (null, 0);
+		var first = rnextfree[FREE_LIST];
+		// Insert into register free list.
+		rprevfree[reg.tag] = FREE_LIST;
+		rnextfree[reg.tag] = first;
+		rprevfree[first] = reg.tag;
+		rnextfree[FREE_LIST] = reg.tag;
+	}
+	def assignReg(r: Loc.Reg, ref: MiRef) {
+		ref.assignment = r;
+		vassign[ref.vreg] = r;
+		var index = r.reg.tag;
+		rcontents[index] = (ref, curpos);
+		var prev = rprevfree[index];
+		var next = rnextfree[index];
+		rnextfree[index] = rprevfree[index] = NOT_FREE;
+		if (prev != NOT_FREE) {
+			// Remove from register free list.
+			rnextfree[prev] = next;
+			rprevfree[next] = prev;
+		}
+	}
+	def allocReg(ref: MiRef, constraint: Reg.set) -> Loc.Reg {
+		var vreg = ref.vreg;
+		if (constraint == NONE) {
+			var first = rnextfree[FREE_LIST];
+			if (first != FREE_LIST) {
+				// Just allocate the first free register.
+				var reg = LOCS[first];
+				vassign[vreg] = reg;
+				return reg;
+			}
+			constraint = Reg.set.all;
+		}
+		// Constrained or no regs left.
+		var choice: Reg, prevmax = int.max;
+		for (r in constraint) {
+			// Consider each register {r}, and let {nextpos = next(r.vreg)}
+			var ref = rcontents[r.tag].0;
+			if (ref == null) return LOCS[r.tag]; // Free; no need to spill.
+
+			var nextpos = vnext[ref.vreg].1;
+			// Don't pick registers used in the same instruction.
+			if (nextpos == curpos) continue;
+			// XXX: Pick a register with {nextpos - pos >= reload_latency}
+			// Pick a register with earliest {prevpos}, which has the 
+			// effect of avoiding conflicts for the longest time.
+			var prevpos = vprev[ref.vreg].1;
+			if (prevpos < prevmax) {
+				prevmax = prevpos;
+				choice = r;
+			}
+		}
+		vassign[rcontents[choice.tag].0.vreg] = Loc.None;
+		reload(rcontents[choice.tag]);
+		return LOCS[choice.tag];
+	}
+	def reload(ref: MiRef, pos: int) {
+		puts("reload v");
+		puti(ref.vreg);
+		puts("@");
+		puti(pos);
+		System.ln();
+		var loc = Loc.Stack(getSlot(ref.vreg));
+		mov(ref.vreg, ref.assignment, loc, pos);
+	}
+	def save(ref: MiRef, pos: int) {
+		puts("save v");
+		puti(ref.vreg);
+		puts("@");
+		puti(pos);
+		System.ln();
+		var loc = Loc.Stack(getSlot(ref.vreg));
+		mov(ref.vreg, loc, ref.assignment, pos);
+	}
+	def mov(vreg: int, dest: Loc, src: Loc, pos: int) {
+		var u = Use.new(vreg).is(src);
+		var d = Def.new(vreg).is(dest);
+		var save = Instr.new(MOV, [d, u]);
+		moves = List.new((save, pos), moves);
+	}
+	def init() {
+		for (i < rcontents.length) rcontents[i] = (null, 0);
+		for (i < rnextfree.length) rnextfree[i] = byte.!(i + 1);
+		for (i < rprevfree.length) rprevfree[i] = byte.!(i - 1);
+		rprevfree[0] = FREE_LIST;
+		rnextfree[FREE_LIST] = 0;
+	}
+	def getSlot(vreg: int) -> i20 {
+		var slot = vstack[vreg];
+		return if(slot == 0, vstack[vreg] = ++stack, slot);
+	}
+}
+
+def ADD = 1;
+def SUB = 2;
+def CALL = 3;
+def MOV = 4;
+def RET = 5;
+def PARAMS = 6;
+
+// Helper for creating instruction sequences.
+class Assembler {
+	new() {
+		instrs[ipos++] = Instr.new(PARAMS, []);
+	}
+
+	def add(a: int, b: int) -> int { return op3(ADD, a, b); }
+	def sub(a: int, b: int) -> int { return op3(SUB, a, b); }
+	def call(a: int, b: int) -> int { return op3(CALL, a, b); }
+	def ret(a: Array<int>) {
+		instrs[ipos++] = Instr.new(RET, Arrays.map(a, Use.new));
+	}
+
+	def newParam() -> int {
+		var vreg = vregs++;
+		var d = Def.new(vreg).at(REGS[vreg]);
+		instrs[0] = Instr.new(PARAMS, Arrays.append(d, instrs[0].operands));
+		return vreg;
+	}
+	def extract() -> Array<Instr> {
+		var result = Array<Instr>.new(ipos);
+		for (i < ipos) result[i] = instrs[i];
+		return result;
+	}
+	def varCount() -> int {
+		return vregs;
+	}
+
+	private var instrs = Array<Instr>.new(100);
+	private var ipos = 0;
+	private var vregs = 0;
+	private def op3(opcode: int, a: int, b: int) -> int {
+		var vreg = vregs++;
+		instrs[ipos++] = Instr.new(opcode, [Def.new(vreg), Use.new(a), Use.new(b)]);
+		return vreg;
+	}
+}
+
+def puts = System.puts;
+def puti = System.puti;
+def putc = System.putc;
+
+def printAssignment(r: Loc) {
+	match (r) {
+		None => ;
+		Reg(reg) => {
+			puts("=%");
+			puts(reg.name);
+		}
+		Stack(slot) => {
+			puts("=#");
+			puti(slot);
+		}
+	}
+}
+
+def printRef(r: MiRef) {
+	if (r == null) return;
+	putc('v');
+	puti(r.vreg);
+	if (r.assignment != Loc.None) {
+		puts("=");
+		print(r.assignment);
+	} else if (r.constraint != NONE) {
+		puts("in{");
+		var first = true;
+		for (reg in Reg.set.all) {
+			if (r.constraint >= reg) {
+				if (!first) puts(",");
+				print(reg);
+				first = false;
+			}
+		}
+		puts("}");
+	}
+	putc(' ');
+}
+
+def printInstrs(instrs: Array<Instr>) {
+	for (j < instrs.length) {
+		var i = instrs[j];
+		puti(j);
+		puts(": ");
+		match (i.opcode) {
+			ADD =>    puts("add   ");
+			SUB =>    puts("sub   ");
+			CALL =>   puts("call  ");
+			MOV =>    puts("mov   ");
+			RET =>    puts("ret   ");
+			PARAMS => puts("param ");
+		}
+		for (o in i.operands) printRef(o);
+		System.ln();
+	}
+}
+
+def print<T>(v: T) {
+	if (string.?(v)) return System.puts(string.!(v));
+	if (Reg.?(v)) {
+		System.puts("%");
+		System.puts(Reg.!(v).name);
+		return;
+	}
+	if (Loc.?(v)) {
+		var loc = Loc.!(v);
+		match (loc) {
+			None => ;
+			Reg(reg) => {
+				puts("%");
+				puts(reg.name);
+			}
+			Stack(slot) => {
+				puts("#");
+				puti(slot);
+			}
+		}
+	}
+	if (int.?(v)) return System.puti(int.!(v));
+	if (Array<Instr>.?(v)) printInstrs(Array<Instr>.!(v));
+}
+
+def main() {
+	var asm = Assembler.new();
+	var p0 = asm.newParam(), p1 = asm.newParam();
+	var x = asm.add(p0, p1);
+	asm.ret([x]);
+	var instrs = asm.extract();
+	print(instrs);
+	puts("--allocated--\n");
+	instrs = Allocator.new(asm.varCount()).allocate(instrs);
+	print(instrs);
+}

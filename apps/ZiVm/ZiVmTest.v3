@@ -1,0 +1,353 @@
+
+def testCountdown() {
+	def l = Label.new();
+	def run = Runner.new(ZiAssembler.new()
+		.const(-160)
+		.bind(l)
+		.iinc()
+		.iinc()
+		.iinc()
+		.brlt(l)
+		.finish());
+	run.assert(2, []);
+}
+
+class Runner(code: Array<byte>) {
+	def assert(val: int, args: Array<int>) {
+		var i = ZiInterpreter.new();
+		for (j < args.length) {
+			i.stack[j] = Val.Int(args[j]);
+		}
+		var result = i.run(code).0;
+		if (result != val) {
+			System.puts("expected: ");
+			System.puti(val);
+			System.puts(", result: ");
+			System.puti(result);
+			System.ln();
+			System.error("TestFailed", "");
+		}
+	}
+	def assertV(val: int, args: Array<Val>) {
+		var i = ZiInterpreter.new();
+		for (j < args.length) {
+			i.stack[j] = args[j];
+		}
+		var result = i.run(code).0;
+		if (result != val) {
+			System.puts("expected: ");
+			System.puti(val);
+			System.puts(", result: ");
+			System.puti(result);
+			System.ln();
+			System.error("TestFailed", "");
+		}
+	}
+	def run(args: Array<int>) -> (int, Array<Val>) {
+		var i = ZiInterpreter.new();
+		for (j < args.length) {
+			i.stack[j] = Val.Int(args[j]);
+		}
+		return i.run(code);
+	}
+	def runV(args: Array<Val>) -> (int, Array<Val>) {
+		var i = ZiInterpreter.new();
+		for (j < args.length) {
+			i.stack[j] = args[j];
+		}
+		return i.run(code);
+	}
+}
+
+def checkVal(expected: Val, got: Val) {
+	if (expected != got) System.error("TestFailed", "wrong value");
+}
+
+def makeBinopCode(f: (ZiAssembler, Reg) -> ZiAssembler) -> Runner {
+	return Runner.new(f(ZiAssembler.new().geti(Reg.R0), Reg.R1).finish());
+}
+
+def testBinops() {
+	def iadd = makeBinopCode(ZiAssembler.iadd);
+	iadd.assert(         7, [3, 4]);
+	iadd.assert(      -999, [-333, -666]);
+	iadd.assert(0x80000003, [0x7fffffff, 4]);
+
+	def isub = makeBinopCode(ZiAssembler.isub);
+	isub.assert(         6, [306, 300]);
+	isub.assert(       -99, [1, 100]);
+	isub.assert(0x80000003, [0x7fffffff, -4]);
+
+	def imul = makeBinopCode(ZiAssembler.imul);
+	imul.assert(      9930, [331, 30]);
+	imul.assert(   -458873, [-71, 6463]);
+	imul.assert(1101454023, [-7155, 1646883]);
+
+	def sidiv = makeBinopCode(ZiAssembler.sidiv);
+	sidiv.assert(       32, [999, 31]);
+	sidiv.assert(    -3223, [-99933, 31]);
+	sidiv.assert(       -1, [-8374873, 8371234]);
+
+	def simod = makeBinopCode(ZiAssembler.simod);
+	simod.assert(        9, [1009, 1000]);
+	simod.assert(     -127, [-10000127, 1000000]);
+	simod.assert(        0, [334455, 334455]);
+
+	def uidiv = makeBinopCode(ZiAssembler.uidiv);
+	uidiv.assert(       37, [1154, 31]);
+	uidiv.assert(138516850, [-944933, 31]);
+	uidiv.assert(      673, [-6374873, 6371234]);
+
+	def uimod = makeBinopCode(ZiAssembler.uimod);
+	uimod.assert(       23, [1023, 1000]);
+	uimod.assert(   967169, [-10000127, 1000000]);
+	uimod.assert(        0, [-331155, -331155]);
+
+	def ixor = makeBinopCode(ZiAssembler.ixor);
+	ixor.assert(    0b1010, [0b1111, 0b0101]);
+	ixor.assert(    0b0010, [0b1111, 0b1101]);
+	ixor.assert(  -8742960, [-8374, 8734874]);
+
+	def iior = makeBinopCode(ZiAssembler.iior);
+	iior.assert(    0b1100, [0b1000, 0b0100]);
+	iior.assert(    0b1110, [0b1100, 0b1110]);
+	iior.assert(     -9347, [-9384, 98349]);
+
+	def iand = makeBinopCode(ZiAssembler.iand);
+	iand.assert(    0b0000, [0b1000, 0b0100]);
+	iand.assert(    0b1100, [0b1100, 0b1110]);
+	iand.assert(   8734866, [-9, 8734874]);
+
+	def ishl = makeBinopCode(ZiAssembler.ishl);
+	ishl.assert(      33388, [8347, 2]);
+	ishl.assert(-2147483648, [118347, 31]);
+	ishl.assert(          0, [8347, 32]);
+
+	def ishr = makeBinopCode(ZiAssembler.ishr);
+	ishr.assert(      10904, [87234, 3]);
+	ishr.assert(          1, [-678, 31]);
+	ishr.assert(          0, [87234, 32]);
+
+	def isar = makeBinopCode(ZiAssembler.isar);
+	isar.assert(     973404, [7787234, 3]);
+	isar.assert(         -1, [-678, 31]);
+	isar.assert(          0, [87234, 32]);
+
+	def sicmp = makeBinopCode(ZiAssembler.sicmp);
+	sicmp.assert(  -1, [3, 4]);
+	sicmp.assert(  -1, [-7, 8]);
+	sicmp.assert(   0, [9999, 9999]);
+	sicmp.assert(   1, [509, 508]);
+	sicmp.assert(   1, [-508, -512]);
+
+	def uicmp = makeBinopCode(ZiAssembler.uicmp);
+	uicmp.assert(  -1, [3, 4]);
+	uicmp.assert(   1, [-7, 8]);
+	uicmp.assert(   0, [9999, 9999]);
+	uicmp.assert(   1, [509, 508]);
+	uicmp.assert(   -1, [-9, -8]);
+}
+
+def testObjectAlloc() {
+	def onew = Runner.new(ZiAssembler.new()
+		.const(5)
+		.onew()
+		.finish());
+	var o = onew.run([]).1;
+	if (o == null || o.length != 5) {
+		System.error("TestFailed", "expected object of size 5");
+	}
+}
+
+def testObjectLength() {
+	def olen = Runner.new(ZiAssembler.new()
+		.geto(Reg.R0)
+		.ogetlen()
+		.finish());
+
+	for (size in [8, 9, 99]) {
+		var obj = Array<Val>.new(size);
+		olen.assertV(size, [Val.Obj(obj)]);
+	}
+}
+
+def testObjectLoads() {
+	def SIZE = 9;
+	def obj = Array<Val>.new(SIZE);
+	def oldst = Runner.new(ZiAssembler.new()
+		.geto(Reg.R0)
+		.geti(Reg.R1)
+		.oldelm(Reg.R0)
+		.geti(Reg.R0)
+		.finish());
+
+	for (i < SIZE) {
+		for (j < SIZE) obj[j] = Val.Int(-1 - j);
+		obj[i] = Val.Int(400 + i);
+		for (j < SIZE) {
+			var val = if(i == j, 400 + i, -1 - j);
+			oldst.assertV(val, [Val.Obj(obj), Val.Int(j)]);
+		}
+	}
+}
+
+def testObjectStores() {
+	def SIZE = 9;
+	def obj = Array<Val>.new(SIZE);
+	def oldst = Runner.new(ZiAssembler.new()
+		.geto(Reg.R0)
+		.geti(Reg.R1)
+		.ostelm(Reg.R2)
+		.finish());
+
+	for (i < SIZE) {
+	for (j < SIZE) obj[j] = Val.Int(-1 - j);
+		var val = 333 + i;
+		oldst.assertV(i, [Val.Obj(obj), Val.Int(i), Val.Int(val)]);
+		for (j < SIZE) {
+			var expected = if(i == j, val, -1 - j);
+			checkVal(Val.Int(expected), obj[j]);
+		}
+	}
+}
+
+def testObjectTree() {
+	def opair = Runner.new(ZiAssembler.new()
+		.const(2)
+		.onew()
+		.const(0)
+		.ostelm(Reg.R0)
+		.const(1)
+		.ostelm(Reg.R1)
+		.finish());
+
+	def vals = [Val.Int(-9), Val.Obj(Array<Val>.new(4)), Val.Obj(Array<Val>.new(2))];
+
+	for (left in vals) {
+		for (right in vals) {
+			var o = opair.runV([left, right]).1;
+			if (o == null || o.length != 2) System.error("TestFailed", "expected object of length 2");
+			checkVal(left, o[0]);
+			checkVal(right, o[1]);
+		}
+	}
+
+}
+
+def testMemory() {
+}
+
+def ALL_REGS = [
+	Reg.R0,   Reg.R1,   Reg.R2,   Reg.R3,   Reg.R4,   Reg.R5,   Reg.R6,   Reg.R7,   Reg.R8,   Reg.R9,
+	Reg.R10,  Reg.R11,  Reg.R12,  Reg.R13,  Reg.R14,  Reg.R15,  Reg.R16,  Reg.R17,  Reg.R18,  Reg.R19,
+	Reg.R20,  Reg.R21,  Reg.R22,  Reg.R23,  Reg.R24,  Reg.R25,  Reg.R26,  Reg.R27,  Reg.R28,  Reg.R29,
+	Reg.R30,  Reg.R31,  Reg.R32,  Reg.R33,  Reg.R34,  Reg.R35,  Reg.R36,  Reg.R37,  Reg.R38,  Reg.R39,
+	Reg.R40,  Reg.R41,  Reg.R42,  Reg.R43,  Reg.R44,  Reg.R45,  Reg.R46,  Reg.R47,  Reg.R48,  Reg.R49,
+	Reg.R50,  Reg.R51,  Reg.R52,  Reg.R53,  Reg.R54,  Reg.R55,  Reg.R56,  Reg.R57,  Reg.R58,  Reg.R59,
+	Reg.R60,  Reg.R61,  Reg.R62,  Reg.R63,  Reg.R64,  Reg.R65,  Reg.R66,  Reg.R67,  Reg.R68,  Reg.R69,
+	Reg.R70,  Reg.R71,  Reg.R72,  Reg.R73,  Reg.R74,  Reg.R75,  Reg.R76,  Reg.R77,  Reg.R78,  Reg.R79,
+	Reg.R80,  Reg.R81,  Reg.R82,  Reg.R83,  Reg.R84,  Reg.R85,  Reg.R86,  Reg.R87,  Reg.R88,  Reg.R89,
+	Reg.R90,  Reg.R91,  Reg.R92,  Reg.R93,  Reg.R94,  Reg.R95,  Reg.R96,  Reg.R97,  Reg.R98,  Reg.R99,
+	Reg.R100, Reg.R101, Reg.R102, Reg.R103, Reg.R104, Reg.R105, Reg.R106, Reg.R107, Reg.R108, Reg.R109,
+	Reg.R110, Reg.R111, Reg.R112, Reg.R113, Reg.R114, Reg.R115, Reg.R116, Reg.R117, Reg.R118, Reg.R119,
+	Reg.R120, Reg.R121, Reg.R122, Reg.R123, Reg.R124, Reg.R125, Reg.R126, Reg.R127, Reg.R128, Reg.R129,
+	Reg.R130, Reg.R131, Reg.R132, Reg.R133, Reg.R134, Reg.R135, Reg.R136, Reg.R137, Reg.R138, Reg.R139,
+	Reg.R140, Reg.R141, Reg.R142, Reg.R143, Reg.R144, Reg.R145, Reg.R146, Reg.R147, Reg.R148, Reg.R149,
+	Reg.R150, Reg.R151, Reg.R152, Reg.R153, Reg.R154, Reg.R155, Reg.R156, Reg.R157, Reg.R158, Reg.R159,
+	Reg.R160, Reg.R161, Reg.R162, Reg.R163, Reg.R164, Reg.R165, Reg.R166, Reg.R167, Reg.R168, Reg.R169,
+	Reg.R170, Reg.R171, Reg.R172, Reg.R173, Reg.R174, Reg.R175, Reg.R176, Reg.R177, Reg.R178, Reg.R179,
+	Reg.R180, Reg.R181, Reg.R182, Reg.R183, Reg.R184, Reg.R185, Reg.R186, Reg.R187, Reg.R188, Reg.R189,
+	Reg.R190, Reg.R191, Reg.R192, Reg.R193, Reg.R194, Reg.R195, Reg.R196, Reg.R197, Reg.R198, Reg.R199,
+	Reg.R200, Reg.R201, Reg.R202, Reg.R203, Reg.R204, Reg.R205, Reg.R206, Reg.R207, Reg.R208, Reg.R209,
+	Reg.R210, Reg.R211, Reg.R212, Reg.R213, Reg.R214, Reg.R215, Reg.R216, Reg.R217, Reg.R218, Reg.R219,
+	Reg.R220, Reg.R221, Reg.R222, Reg.R223, Reg.R224, Reg.R225, Reg.R226, Reg.R227, Reg.R228, Reg.R229,
+	Reg.R230, Reg.R231, Reg.R232, Reg.R233, Reg.R234, Reg.R235, Reg.R236, Reg.R237, Reg.R238, Reg.R239,
+	Reg.R240, Reg.R241, Reg.R242, Reg.R243, Reg.R244, Reg.R245, Reg.R246, Reg.R247, Reg.R248, Reg.R249,
+	Reg.R250, Reg.R251, Reg.R252, Reg.R253, Reg.R254, Reg.R255
+];
+
+def testRegisters() {
+	for (r in ALL_REGS) {
+		def get = Runner.new(ZiAssembler.new()
+			.begin(255)
+			.const(44)
+			.seti(r)
+			.const(33)
+			.geti(r)
+			.finish());
+		get.assert(44, []);
+	}
+	for (r in ALL_REGS) {
+		def get = Runner.new(ZiAssembler.new()
+			.begin(255)
+			.const(44)
+			.onew()
+			.seto(r)
+			.const(33)
+			.onew()
+			.geto(r)
+			.finish());
+		var x = get.run([]).1;
+		if (x.length != 44) System.error("TestFailed", "");
+	}
+	for (x in [Reg.R0, Reg.R1, Reg.R44]) {
+		for (y in [Reg.R2, Reg.R3, Reg.R166]) {
+			def get = Runner.new(ZiAssembler.new()
+				.begin(255)
+				.const(49)
+				.seti(x)
+				.mov(y, x)
+				.geti(y)
+				.finish());
+
+			get.assert(49, []);
+		}
+	}
+}
+
+def testCalls() {
+	def code = Runner.new(ZiAssembler.new()
+			.begin(2)
+			.const(7)
+			.call(2)
+			.exit()
+			.geti(Reg.R1)
+			.iadd(Reg.R0)
+			.ret(1)
+			.finish());
+
+	code.assert(       666, [111, 555]);
+	code.assert(      -999, [-333, -666]);
+	code.assert(0x80000003, [0x7fffffff, 4]);
+}
+
+def testBranches() {
+}
+
+def testConstants() {
+	for (k in [0, 1, -1, -2, -4, 6, 127, -128, -127]) {
+		var run = Runner.new(ZiAssembler.new().const(k).finish());
+		run.assert(k, []);
+	}
+	for (b in [128, 129, 130, -129, -130, -150, 1000, -10993, 32767, -32768]) {
+		for (k in [b, b << 2, b << 8, b << 13, b << 16, b << 24]) {
+			var run = Runner.new(ZiAssembler.new().const(k).finish());
+			run.assert(k, []);
+		}
+	}
+}
+
+def main() {
+	testConstants();
+	testRegisters();
+	testBranches();
+	testCalls();
+	testBinops();
+	testObjectAlloc();
+	testObjectLength();
+	testObjectLoads();
+	testObjectStores();
+	testObjectTree();
+	testMemory();
+	testCountdown();
+}

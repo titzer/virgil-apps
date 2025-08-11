@@ -1,0 +1,230 @@
+// Copyright 2013 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def T: Vt100;
+def stages = [
+	"Parser",
+	"Seman",
+	"Interpreting",
+	"Interpreting  -ra",
+	"Interpreting  -ra -ma",
+	"Compiling     jvm",
+	"  running",
+	"Compiling     wasm-js",
+	"  running",
+	"Compiling     x86-darwin",
+	"  running",
+	"Compiling     x86-linux",
+	"  running",
+	"Compiling     x86-64-linux"
+];
+def suites = [
+	Suite.new("base", stages),
+	Suite.new("legacy", stages),
+	Suite.new("future", stages),
+	Suite.new("enums", stages),
+	Suite.new("variants", stages),
+	Suite.new("rt", stages),
+	Suite.new("ptr32", stages),
+	Suite.new("stacktrace", stages),
+	Suite.new("float", stages)
+];
+def TICKS = 10;
+def UPPER_LEFT = (3, 35);
+
+def main(args: Array<string>) {
+	scroll_concept();
+}
+
+def scroll_concept() {
+	def suites = [
+"unit", "asm/x86", "asm/x86-64", "core", "legacy_cast", "future_cast", "variants", "enums", "fsi32", "fsi64", "float", "large", "ptr32", "ptr64", "darwin", "linux", "rt", "stacktrace", "gc", "system", "lib", "wizeng", "apps", "bench"
+	];
+	def status = [
+		"parse",
+		"seman",
+		"compile x86",
+		"compile arm",
+		"run x86@linux",
+		"run arm@emu"
+	];
+	def fail = Array<bool>.new(suites.length);
+	def counts = Array<int>.new(status.length);
+	var s = 0;
+	for (i < 10000) {
+		delay(20);
+		if (i % 176 == 1) {
+			// simulate failure
+			T.eraseToEndOfLine();
+			if (!fail[s]) {
+				T.puts("test/");
+				T.puts(suites[s]);
+				T.fgNorm();
+				T.ln();
+				T.eraseToEndOfLine();
+			}
+			T.fgRed();
+			T.puts("  ");
+			T.puts(status[i % status.length]);
+			T.fgNorm();
+			T.puts(" test/");
+			T.puts(suites[s]);
+			T.puts("/test");
+			T.puti(i);
+			T.fgNorm();
+			T.ln();
+			fail[s] = true;
+		}
+		if ((i % 50) == 9) { // end suite
+			if (!fail[s]) {
+				T.eraseToEndOfLine();
+				T.puts("test/");
+				T.puts(suites[s]);
+				T.puts(": ");
+				T.fgGreen();
+				T.puts("ok");
+				T.fgNorm();
+				T.ln();
+			}
+			s++;
+			for (i < counts.length) counts[i] = 0;
+		} else {
+			counts[0] += 11;
+			counts[1] += 4;
+			counts[2] += 2;
+			counts[3] += 1;
+		}
+		if (s >= suites.length) break;
+		redraw(suites, s, fail, status, counts);
+	}
+	for (i < counts.length + 1) {
+		T.eraseToEndOfLine();
+		T.ln();
+	}
+	for (i < counts.length+2) T.moveCursorUp(1);
+}
+
+var blink = 0;
+var blinkL = [">", "_"];
+var blinkR = ["<", "_"];
+def redraw(suites: Array<string>, s: int, fail: Array<bool>, status: Array<string>, counts: Array<int>) {
+	T.eraseToEndOfLine();
+	for (i < s) {
+		if (fail[i]) T.fgRed();
+		else T.fgGreen();
+		T.puts(suites[i]);
+		T.putc(' ');
+	}
+	T.fgNorm();
+	T.puts(blinkL[blink]);
+	
+	if (fail[s]) T.fgRed();
+	else T.fgCyan();
+	T.puts(suites[s]);
+	T.fgNorm();
+
+	T.puts(blinkR[blink]);
+	T.puts(" ");
+	blink = (blink + 1) % blinkL.length;
+	
+	for (i = s + 1; i < suites.length; i++) {
+		T.puts(suites[i]);
+		T.putc(' ');
+	}
+	T.ln();	
+	T.eraseToEndOfLine();
+	T.puts("----------------------------------------\n");
+	for (i < counts.length) {
+		T.eraseToEndOfLine();
+		T.fgGreen();
+		T.puts("  ");
+		T.puts(status[i]);
+		for (j = status[i].length; j < 32; j++) T.putc(' ');
+		T.fgNorm();
+		T.puts("| ");
+		T.puti(counts[i]);
+		T.ln();
+	}
+	for (i < counts.length+2) T.moveCursorUp(1);// T.puts("\x1b[1A");
+}
+
+def delay(ms: int) {
+	var start = System.ticksMs();
+	while (System.ticksMs() - start < ms) ;
+}
+
+def matrix_concept() {
+	T.eraseScreen();
+	T.hideCursor();
+
+//	animator.run();
+	T.moveCursor(0, 0);
+	T.fgCyan();
+	T.puts("compiler=/tmp/titzer/virgil-test/bootstrap/jar/Aeneas");
+	T.fgNorm();
+	for (i < stages.length) {
+		T.moveCursor(UPPER_LEFT.0 + i, 3);
+		T.puts(stages[i]);
+	}
+	T.fgYellow();
+	for (i < suites.length) {
+		T.moveCursor(UPPER_LEFT.0 - 1, UPPER_LEFT.1 + i * (TICKS + 2));
+		T.puts(suites[i].str);
+	}
+
+	var c = 0;
+	var failures = 0;
+	while (c < stages.length * suites.length * 10) {
+		var s = Random.random(suites.length);
+		if (suites[s].count >= stages.length * TICKS) continue;
+		var pass = Random.random(200) != 0;
+		update(s, pass);
+		if (!pass) {
+			failures++;
+			T.moveCursor(4 + stages.length, 1);
+			T.fgRed();
+			T.puts("test/float/seman/foo.v3");
+			T.fgNorm();
+		}
+		sleep(10);
+		c++;
+	}
+	T.fgNorm();
+	T.moveCursor(10 + stages.length, 1);
+	if (failures > 0) {
+		T.puti(failures);
+		T.fgRed();
+		T.puts(" failures\n");
+	}
+	T.fgNorm();
+	T.showCursor();
+}
+def sleep(ms: int) {
+	var start = u32.view(System.ticksMs());
+	while (u32.view(System.ticksMs()) - start < ms) ;
+}
+def update(i: int, pass: bool) {
+	var s = suites[i];
+	var j = s.count / TICKS;
+	var col = s.count % TICKS;
+	if (col == 0) {
+		T.moveCursor(UPPER_LEFT.0 + j, UPPER_LEFT.1 + i * (TICKS + 2));
+		T.fgNorm();
+		T.puts("..........");
+	}
+	T.moveCursor(UPPER_LEFT.0 + j, col + UPPER_LEFT.1 + i * (TICKS + 2));
+	if (pass) {
+		T.fgGreen();
+		T.putc('o');
+	} else {
+		T.fgRed();
+		T.putc('X');
+	}
+	s.count++;
+}
+def keypress(ch: int) {
+}
+
+class Suite(str: string, stages: Array<string>) {
+	var count = 0;
+}

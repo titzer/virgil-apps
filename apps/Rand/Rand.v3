@@ -1,0 +1,41 @@
+// Copyright 2013 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def INTSIZE = 64;
+def BYTESIZE = INTSIZE * 4;
+def buf = Array<byte>.new(BYTESIZE);
+
+// A random number generating utility that dumps random bytes to the console.
+def main(args: Array<string>) {
+	if (args.length == 0) runForever();
+	for (a in args) {
+		var p = Ints.parseDecimal(a, 0);
+		if (p.0 > 0) Random.seed = Random.seed ^ p.1;
+	}
+	var p = Ints.parseDecimal(args[0], 0);
+	if (p.0 > 0) run(p.1);
+	else System.error("UserError", "invalid length specified");
+}
+def run(bytes: int) {
+	while (bytes >= BYTESIZE) {
+		for (i < INTSIZE) put(i * 4);
+		System.puts(buf);
+		bytes = bytes - BYTESIZE;
+	}
+	while (bytes-- > 0) {
+		System.putc(byte.view(Random.next()));
+	}
+}
+def runForever() {
+	while (true) {
+		for (i < INTSIZE) put(i * 4);
+		System.puts(buf);
+	}
+}
+def put(index: int) {
+	var val = Random.next();
+	buf[index + 0] = byte.view(val);
+	buf[index + 1] = byte.view(val >>> 8);
+	buf[index + 2] = byte.view(val >>> 16);
+	buf[index + 3] = byte.view(val >>> 24);
+}

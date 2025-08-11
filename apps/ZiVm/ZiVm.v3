@@ -1,0 +1,481 @@
+//--- Registers -----------------------------------------------------
+def GETO  = '\x00'; // %K          oa    = r[K]
+def SETO  = '\x01'; // %K          r[K]  = oa
+def GETI  = '\x02'; // %K          ia    = r[K]
+def SETI  = '\x03'; // %K          r[K]  = ia
+def MOV   = '\x04'; // %K1 %K2     r[K1] = r[K2]
+//--- Constants --------------------------------------------------
+def KZERO = '\x05'; //             ia = #0
+def KSB   = '\x06'; // #K          ia = sxb(K)
+def KSW   = '\x07'; // #K          ia = sxw(K)
+def KZB   = '\x08'; // #K          ia = zxb(K)
+def KZW   = '\x09'; // #K          ia = zxw(K)
+def KWL   = '\x0a'; // #K  #K      ia = ia & 0xFFFF0000 | K
+def KWH   = '\x0b'; // #K  #K      ia = ia & 0x0000FFFF | (K << 16)
+	//--- Branches ---------------------------------------------------
+def JMP   = '\x0c'; // #K          goto ip+K
+def BRZ   = '\x0d'; // #K          if(ia == 0) goto ip+K
+def BRLT  = '\x0e'; // #K          if(ia < 0) goto ip+K
+def BRLE  = '\x0f'; // #K          if(ia <= 0) goto ip+K
+	//-- int32 ops ---------------------------------------------------
+def SICMP = '\x10'; // %K          ia = ia < r[K] ? -1 : (ia == r[K] ? 0 : 1)
+def UICMP = '\x11'; // %K          ia = ia < r[K] ? -1 : (ia == r[K] ? 0 : 1)
+def IADD  = '\x12'; // %K          ia = ia + r[K]
+def IINC  = '\x13'; //             ia = ia + 1
+def IDEC  = '\x14'; //             ia = ia + 1
+def ISUB  = '\x15'; // %K          ia = ia - r[K]
+def IMUL  = '\x16'; // %K          ia = ia * r[K]
+def SIDIV = '\x17'; // %K          ia = ia / r[K]
+def SIMOD = '\x18'; // %K          ia = ia % r[K]
+def UIDIV = '\x19'; // %K          ia = ia / r[K]
+def UIMOD = '\x1a'; // %K          ia = ia % r[K]
+def IXOR  = '\x1b'; // %K          ia = ia ^ r[K]
+def IIOR  = '\x1c'; // %K          ia = ia | r[K]
+def IAND  = '\x1d'; // %K          ia = ia & r[K]
+def ISHL  = '\x1e'; // %K          ia = ia << r[K]
+def ISHR  = '\x1f'; // %K          ia = ia >>> r[K]
+def ISAR  = '\x20'; // %K          ia = ia >> r[K]
+	//--- objects ----------------------------------------------------
+def ONEW    = '\x31'; //             oa     = oalloc(ia)      - create new object
+def OLDELM  = '\x32'; // %K          r[K]   = oa[ia]          - get object element
+def OSTELM  = '\x21'; // %K          oa[ia] = r[K]            - set object element
+def OGETLEN = '\x22'; //             ia     = oa.length       - get object length
+	//--- raw objects ------------------------------------------------
+def MNEW     = '\x23'; //             oa     = ralloc(ia)   - allocate raw memory object
+def MGETSIZE = '\x24'; //             ia     = oa.length    - get size of raw memory object
+def MLDZB    = '\x25'; //             ia     = zxb(oa[ia])  - load byte  (8-bit)  + zero extend
+def MLDSB    = '\x26'; //             ia     = sxb(oi[ia])  - load byte  (8-bit)  + sign extend
+def MSTB     = '\x27'; // %K          oa[ia] = r[K]         - store byte (8-bit)
+def MLDZW    = '\x28'; //             ia     = zxw(oa[ia])  - load word  (16-bit) + zero extend
+def MLDSW    = '\x29'; //             ia     = sxw(oa[ia])  - load word  (16-bit) + sign extend
+def MSTW     = '\x2a'; // %K          oa[ia] = r[K]         - store word (16-bit)
+def MLDI     = '\x2b'; //             ia     = oa[ia]       - load int   (32-bit)
+def MSTI     = '\x2c'; // %K          oa[ia] = r[K]         - store int  (32-bit)
+//--- call/ret ---------------------------------------------------
+def CALL     = '\x2d'; // #K          call ia r[N-K] r[N-k+1] ...
+def RET      = '\x2e'; // #K          ret     r[N-K] r[N-k+1] ...
+def BEGIN    = '\x2f'; // #K          alloc r[K]
+def EXIT     = '\x30';
+
+class Label {
+	var pos: int = -1;
+	var refs: List<int>;
+}
+
+enum Reg {
+	R0,   R1,   R2,   R3,   R4,   R5,   R6,   R7,   R8,   R9,
+	R10,  R11,  R12,  R13,  R14,  R15,  R16,  R17,  R18,  R19,
+	R20,  R21,  R22,  R23,  R24,  R25,  R26,  R27,  R28,  R29,
+	R30,  R31,  R32,  R33,  R34,  R35,  R36,  R37,  R38,  R39,
+	R40,  R41,  R42,  R43,  R44,  R45,  R46,  R47,  R48,  R49,
+	R50,  R51,  R52,  R53,  R54,  R55,  R56,  R57,  R58,  R59,
+	R60,  R61,  R62,  R63,  R64,  R65,  R66,  R67,  R68,  R69,
+	R70,  R71,  R72,  R73,  R74,  R75,  R76,  R77,  R78,  R79,
+	R80,  R81,  R82,  R83,  R84,  R85,  R86,  R87,  R88,  R89,
+	R90,  R91,  R92,  R93,  R94,  R95,  R96,  R97,  R98,  R99,
+	R100, R101, R102, R103, R104, R105, R106, R107, R108, R109,
+	R110, R111, R112, R113, R114, R115, R116, R117, R118, R119,
+	R120, R121, R122, R123, R124, R125, R126, R127, R128, R129,
+	R130, R131, R132, R133, R134, R135, R136, R137, R138, R139,
+	R140, R141, R142, R143, R144, R145, R146, R147, R148, R149,
+	R150, R151, R152, R153, R154, R155, R156, R157, R158, R159,
+	R160, R161, R162, R163, R164, R165, R166, R167, R168, R169,
+	R170, R171, R172, R173, R174, R175, R176, R177, R178, R179,
+	R180, R181, R182, R183, R184, R185, R186, R187, R188, R189,
+	R190, R191, R192, R193, R194, R195, R196, R197, R198, R199,
+	R200, R201, R202, R203, R204, R205, R206, R207, R208, R209,
+	R210, R211, R212, R213, R214, R215, R216, R217, R218, R219,
+	R220, R221, R222, R223, R224, R225, R226, R227, R228, R229,
+	R230, R231, R232, R233, R234, R235, R236, R237, R238, R239,
+	R240, R241, R242, R243, R244, R245, R246, R247, R248, R249,
+	R250, R251, R252, R253, R254, R255
+}
+
+class ZiAssembler {
+	var buffer = Vector<byte>.new();
+	//--- Registers -----------------------------------------------------
+	def geto(reg: Reg) -> ZiAssembler { return put2(GETO, reg.tag); }
+	def seto(reg: Reg) -> ZiAssembler { return put2(SETO, reg.tag); }
+	def geti(reg: Reg) -> ZiAssembler { return put2(GETI, reg.tag); }
+	def seti(reg: Reg) -> ZiAssembler { return put2(SETI, reg.tag); }
+	def mov (rd: Reg, rs: Reg) -> ZiAssembler { return put3(MOV, rd.tag, rs.tag); }
+	//--- Constants --------------------------------------------------
+	def const(i: int) -> ZiAssembler {
+		if (i == 0) return put1(KZERO);
+		if (u8.view(i) == i) return put2(KZB, byte.view(i));
+		if (i8.view(i) == i) return put2(KSB, byte.view(i));
+		if (u16.view(i) == i) return put3(KZW, byte.view(i), byte.view(i >> 8));
+		if (i16.view(i) == i) return put3(KSW, byte.view(i), byte.view(i >> 8));
+		if ((i >>> 16) == i) {
+			put1(KZERO);
+			put3(KWH, byte.view(i >> 16), byte.view(i >> 24));
+			return this;
+		}
+		put3(KWL, byte.view(i), byte.view(i >> 8));
+		put3(KWH, byte.view(i >> 16), byte.view(i >> 24));
+		return this;
+	}
+	//--- Branches ---------------------------------------------------
+	def jmp (label: Label) -> ZiAssembler { return put2(JMP , ref(label)); }
+	def brz (label: Label) -> ZiAssembler { return put2(BRZ , ref(label)); }
+	def brlt(label: Label) -> ZiAssembler { return put2(BRLT, ref(label)); }
+	def brle(label: Label) -> ZiAssembler { return put2(BRLE, ref(label)); }
+	//-- int32 ops ---------------------------------------------------
+	def sicmp (reg: Reg) -> ZiAssembler { return put2(SICMP, reg.tag); }
+	def uicmp (reg: Reg) -> ZiAssembler { return put2(UICMP, reg.tag); }
+	def iadd  (reg: Reg) -> ZiAssembler { return put2(IADD , reg.tag); }
+	def iinc  () -> ZiAssembler { return put1(IINC); }
+	def idec  (reg: Reg) -> ZiAssembler { return put2(IDEC , reg.tag); }
+	def isub  (reg: Reg) -> ZiAssembler { return put2(ISUB , reg.tag); }
+	def imul  (reg: Reg) -> ZiAssembler { return put2(IMUL , reg.tag); }
+	def sidiv (reg: Reg) -> ZiAssembler { return put2(SIDIV, reg.tag); }
+	def simod (reg: Reg) -> ZiAssembler { return put2(SIMOD, reg.tag); }
+	def uidiv (reg: Reg) -> ZiAssembler { return put2(UIDIV, reg.tag); }
+	def uimod (reg: Reg) -> ZiAssembler { return put2(UIMOD, reg.tag); }
+	def ixor  (reg: Reg) -> ZiAssembler { return put2(IXOR , reg.tag); }
+	def iior  (reg: Reg) -> ZiAssembler { return put2(IIOR , reg.tag); }
+	def iand  (reg: Reg) -> ZiAssembler { return put2(IAND , reg.tag); }
+	def ishl  (reg: Reg) -> ZiAssembler { return put2(ISHL , reg.tag); }
+	def ishr  (reg: Reg) -> ZiAssembler { return put2(ISHR , reg.tag); }
+	def isar  (reg: Reg) -> ZiAssembler { return put2(ISAR , reg.tag); }
+	//--- objects ----------------------------------------------------
+	def onew   () -> ZiAssembler { return put1(ONEW); }
+	def oldelm (reg: Reg) -> ZiAssembler { return put2(OLDELM  , reg.tag); }
+	def ostelm (reg: Reg) -> ZiAssembler { return put2(OSTELM  , reg.tag); }
+	def ogetlen() -> ZiAssembler { return put1(OGETLEN); }
+	//--- memory access ----------------------------------------------
+	def mnew    () -> ZiAssembler { return put1(MNEW    ); }
+	def mgetsize() -> ZiAssembler { return put1(MGETSIZE); }
+	def mldzb   () -> ZiAssembler { return put1(MLDZB   ); }
+	def mldsb   () -> ZiAssembler { return put1(MLDSB   ); }
+	def mstb    (reg: Reg) -> ZiAssembler { return put2(MSTB     , reg.tag); }
+	def mldzw   () -> ZiAssembler          { return put1(MLDZW); }
+	def mldsw   () -> ZiAssembler          { return put1(MLDSW); }
+	def mstw    (reg: Reg) -> ZiAssembler { return put2(MSTW     , reg.tag); }
+	def mldi    () -> ZiAssembler          { return put1(MLDI); }
+	def msti    (reg: Reg) -> ZiAssembler { return put2(MSTI     , reg.tag); }
+	//--- call/ret ---------------------------------------------------
+	def call (count: byte) -> ZiAssembler { return put2(CALL , count); }
+	def ret  (count: byte) -> ZiAssembler { return put2(RET  , count); }
+	def begin(count: byte) -> ZiAssembler { return put2(BEGIN, count); }
+	def exit () -> ZiAssembler { return put1(EXIT); }
+
+	def bind(label: Label) -> ZiAssembler {
+		label.pos = buffer.length;
+		for (l = label.refs; l != null; l = l.tail) {
+			var pos = l.head;
+			buffer[pos + 1] = rel(label, pos);
+		}
+		return this;
+	}
+	def ref(label: Label) -> byte {
+		if (label.pos >= 0) return rel(label, buffer.length);
+		label.refs = List.new(buffer.length, label.refs);
+		return 0;
+	}
+	def rel(label: Label, pos: int) -> byte {
+		var diff = label.pos - pos;
+		if (TRACE) {
+			System.puts("diff:");
+			System.puti(diff);
+			System.ln();
+		}
+		return byte.view(diff);
+	}
+
+	// --- Internal implementation
+	def put1(a: byte) -> ZiAssembler {
+		buffer.put(a);
+		return this;
+	}
+	def put2(a: byte, b: byte) -> ZiAssembler {
+		buffer.put(a);
+		buffer.put(b);
+		return this;
+	}
+	def put3(a: byte, b: byte, c: byte) -> ZiAssembler {
+		buffer.put(a);
+		buffer.put(b);
+		buffer.put(c);
+		return this;
+	}
+	def finish() -> Array<byte> {
+		put2(EXIT, 0);
+		return buffer.extract();
+	}
+}
+
+type Val {
+	case Int(val: int);
+	case Obj(val: Array<Val>);
+}
+
+type Result {
+	case Ok(ia: int, oa: Array<Val>);
+	case Fail(ex: string, trace: Array<int>);
+}
+
+def DivideError = "DivideError";
+def TypeError = "TypeError";
+def NullCheck = "NullCheckException";
+def BoundsCheck = "BoundsCheckException";
+def LengthCheck = "LengthCheckException";
+
+def TRACE = false;
+
+class ZiInterpreter {
+	var stack = Array<Val>.new(128);
+	var rp: int;
+	var fp: int;
+	var count: int;
+
+	def ireg(num: int) -> int {
+		match (stack[rp + num]) {
+			Int(val) => return val;
+			_ => return throwError(TypeError, "expected int");
+		}
+	}
+	def oreg(num: int) -> Array<Val> {
+		match (stack[rp + num]) {
+			Obj(val) => return val;
+			_ => return throwError(TypeError, "expected object");
+		}
+	}
+	def throwError<T>(error: string, expected: string) -> T {
+		System.error(error, expected);
+		var t: T;
+		return t;
+	}
+	// Run the given {code}, returning the result of the integer accumulator and object accumulator.
+	def run(code: Array<byte>) -> (int, Array<Val>) {
+		var regs = this.stack;
+		var rp = this.rp;
+		var ia: int;
+		var oa: Array<Val>;
+		var pc: int;
+
+		while (true) {
+//			count++;
+			var param = code[pc+1];
+			var len = 2;
+			if (TRACE) {
+				System.puts("@");
+				System.puti(pc);
+				System.puts(": ");
+				System.puti(code[pc] & 0xff);
+				System.puts(" IA = ");
+				System.puti(ia);
+				System.puts(" R@");
+				System.puti(rp);
+				System.puts(" = ");
+				for (i = rp; i < fp; i++) {
+					match (regs[i]) {
+						Int(v) => { System.puti(v); System.putc(' '); }
+						Obj(v) => { System.putc('#'); System.putc(' '); }
+					}
+				}
+				System.ln();
+			}
+			match(code[pc]) {
+				GETO => {
+					oa = oreg(param);
+				}
+				SETO => {
+					regs[rp + param] = Val.Obj(oa);
+				}
+				GETI => {
+					ia = ireg(param);
+				}
+				SETI => {
+					regs[rp + param] = Val.Int(ia);
+				}
+				MOV => {
+					regs[rp + param] = regs[rp + code[pc+2]];
+					len = 3;
+				}
+				KZERO => {
+					ia = 0;
+					len = 1;
+				}
+				KSB => {
+					ia = i8.view(param);
+				}
+				KSW => {
+					ia = param;
+					ia |= i16.view(code[pc+2]) << 8;
+					len = 3;
+				}
+				KZB => {
+					ia = u8.view(param);
+					len = 2;
+				}
+				KZW => {
+					ia = param;
+					ia |= u16.view(code[pc+2]) << 8;
+					len = 3;
+				}
+				KWL => {
+					ia &= 0xFFFF0000;
+					ia |= int.view(param) << 0;
+					ia |= int.view(code[pc+2]) << 8;
+					len = 3;
+				}
+				KWH => {
+					ia &= 0xFFFF;
+					ia |= int.view(param) << 16;
+					ia |= int.view(code[pc+2]) << 24;
+					len = 3;
+				}
+				JMP => {
+					len = i8.view(param);
+				}
+				BRZ => {
+					len = if(ia == 0, i8.view(param), 2);
+				}
+				BRLT => {
+					len = if(ia < 0, i8.view(param), 2);
+				}
+				BRLE => {
+					len = if(ia <= 0, i8.view(param), 2);
+				}
+				SICMP => {
+					var l = ia, r = ireg(param);
+					ia = if(l < r, -1, if(l > r, 1));
+				}
+				UICMP => {
+					var l = u32.view(ia), r = u32.view(ireg(param));
+					ia = if(l < r, -1, if(l > r, 1));
+				}
+				IADD =>  {
+					ia += ireg(param);
+				}
+				IINC =>  {
+					ia++;
+					len = 1;
+				}
+				IDEC =>  {
+					ia--;
+					len = 1;
+				}
+				ISUB =>  {
+					ia -= ireg(param);
+				}
+				IMUL =>  {
+					ia *= ireg(param);
+				}
+				SIDIV => {
+					var l = ia, r = ireg(param);
+					if (r == 0) ia = throwError(DivideError, "");
+					else ia /= r;
+				}
+				SIMOD => {
+					var l = ia, r = ireg(param);
+					if (r == 0) ia = throwError(DivideError, "");
+					else ia %= r;
+				}
+				UIDIV => {
+					var l = u32.view(ia), r = u32.view(ireg(param));
+					if (r == 0) ia = throwError(DivideError, "");
+					else ia = int.view(l / r);
+				}
+				UIMOD => {
+					var l = u32.view(ia), r = u32.view(ireg(param));
+					if (r == 0) ia = throwError(DivideError, "");
+					else ia = int.view(l % r);
+				}
+				IXOR =>  {
+					ia ^= ireg(param);
+				}
+				IIOR =>  {
+					ia |= ireg(param);
+				}
+				IAND =>  {
+					ia &= ireg(param);
+				}
+				ISHL =>  {
+					var r = ireg(param), r5 = u5.view(r);
+					ia = if(r == r5, ia << r5);
+				}
+				ISHR =>  {
+					var r = ireg(param), r5 = u5.view(r);
+					ia = if(r == r5, ia >>> r5);
+				}
+				ISAR =>  {
+					var r = ireg(param), r5 = u5.view(r);
+					ia = if(r == r5, ia >> r5, ia >> 31);
+				}
+				ONEW => {
+					if (ia < 0) oa = throwError(LengthCheck, null);
+					else oa = Array<Val>.new(ia);
+					len = 1;
+				}
+				OLDELM => {
+					if (oa == null) oa = throwError(NullCheck, null);
+					else if (u32.view(ia) >= u32.view(oa.length)) oa = throwError(BoundsCheck, null);
+					else regs[rp + param] = oa[ia];
+				}
+				OSTELM => {
+					if (oa == null) oa = throwError(NullCheck, null);
+					else if (u32.view(ia) >= u32.view(oa.length)) oa = throwError(BoundsCheck, null);
+					oa[ia] = regs[rp + param];
+				}
+				OGETLEN => {
+					if (oa == null) oa = throwError(NullCheck, null);
+					else ia = oa.length;
+					len = 1;
+				}
+				CALL => {
+					regs = grow(param + 2);
+					regs[fp] = Val.Int(pc+2);
+					regs[fp+1] = Val.Int(rp);
+					var base = fp - param;
+					rp = fp + 2;
+					for (i < param) {
+						regs[rp + i] = regs[base + i];
+					}
+					fp += param + 2;
+					len = ia - pc;
+				}
+				RET => {
+					var nip = toInt(regs[rp-2]);
+					var nrp = toInt(regs[rp-1]);
+					var base = rp - 2 - param;
+					for (i < param) {
+						regs[base + i] = regs[fp - param + i];
+					}
+					fp = rp - 2;
+					rp = nrp;
+					len = nip - pc;
+				}
+				BEGIN => {
+					regs = grow(param);
+					fp += param;
+				}
+				EXIT => {
+					return (ia, oa);
+				}
+			}
+			pc += len;
+		}
+		return (ia, oa);
+	}
+	def grow(by: int) -> Array<Val> {
+		var size = fp + by;
+		if (stack.length < size) {
+			var nstack = Array<Val>.new(size + stack.length);
+			for (i < stack.length) nstack[i] = stack[i];
+			stack = nstack;
+		}
+		return stack;
+	}
+	def toInt(v: Val) -> int {
+		match (v) {
+			Int(val) => return val;
+			_ => return throwError(TypeError, "expected int");
+		}
+	}
+	// | caller frame .... | ret | fp |
+	// ^ rp                ^ fp
+	//                                | callee frame .... |
+	//                                ^ rp'               ^ fp'
+}

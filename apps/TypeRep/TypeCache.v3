@@ -1,0 +1,267 @@
+// Copyright 2020 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Cache for global singleton types like "void" and "bool".
+component GlobalTypeCache {
+	def NONE = Array<Type>.new(0);
+	def VOID = VoidType.new();
+	def BOOL = BoolType.new();
+	def NULL = NullType.new();
+	def BYTE = IntTypeCache.get(false, 8);
+	def INT = IntTypeCache.get(true, 32);
+	def U32 = IntTypeCache.get(false, 32);
+	def LONG = IntTypeCache.get(true, 64);
+	def U64 = IntTypeCache.get(false, 64);
+	def STRING = ArrayTypeCache.get(BYTE);
+}
+
+// Cache for integer types "iNN" and "uNN".
+component IntTypeCache {
+	private def max = 64;
+	private def cache = Array<IntType>.new(max * 2);
+
+	def get(signed: bool, width: byte) -> IntType {
+		var index = (width + if(signed, max)) - 1;
+		var t = cache[index];
+		if (t != null) return t;
+		return cache[index] = IntType.new(signed, width);
+	}
+}
+
+// Cache for floating point types "float" and "double".
+component FloatTypeCache {
+	def FLOAT = FloatType.new(32, 23);
+	def DOUBLE = FloatType.new(64, 52);
+}
+
+// Cache for tuple types "(T, T)". Handles degenerate cases of nullary and unary
+// tuples, which are "void" and identity, respectively.
+component TupleTypeCache {
+	private def cache = TupleTypeCacheImpl.new();
+	def get(args: Array<Type>) -> Type {
+		if (args.length == 0) return GlobalTypeCache.VOID;
+		if (args.length == 1) return args[0];
+		return cache.get(args);
+	}
+}
+class TupleTypeCacheImpl extends TypeCacheA<TupleType>(Kind.TUPLE, 0) {
+	def equal(t: TupleType, args: Array<Type>) -> bool {
+		return Arrays.equal(t.elemTypes, args);
+	}
+	def make(hash: u32, args: Array<Type>) -> TupleType {
+		return TupleType.new(hash, args);
+	}
+}
+
+// Cache for all array types "Array<T>".
+component ArrayTypeCache {
+	private def immGet = ImmArrayTypeCacheImpl.new().get;
+	def get(t: Type) -> ArrayType {
+		// Array types are so common that every type "T" has a field {array} that caches "Array<T>".
+		return if (t.array != null, t.array, t.array = ArrayType.new(TypeHash.do1(Kind.ARRAY, 1, t), true, t));
+	}
+	def get2(writable: bool, t: Type) -> ArrayType {
+		return if(writable, get(t), immGet(t));
+	}
+}
+class ImmArrayTypeCacheImpl extends TypeCache<Type, ArrayType> {
+	def hash(t: Type) -> u32 {
+		return TypeHash.do1(Kind.ARRAY, 0, t);
+	}
+	def equal(a: ArrayType, b: Type) -> bool {
+		return a.elemType == b;
+	}
+	def make(hash: u32, t: Type) -> ArrayType {
+		return ArrayType.new(hash, false, t);
+	}
+}
+
+// Cache for all range types "Range<T>".
+component RangeTypeCache {
+	def get = RangeTypeCacheImpl.new().get;
+}
+class RangeTypeCacheImpl extends TypeCache<(bool, Type), RangeType> {
+	def hash(writable: bool, elemType: Type) -> u32 {
+		return TypeHash.do1(Kind.RANGE, if(writable, 1), elemType);
+	}
+	def equal(a: RangeType, b: (bool, Type)) -> bool {
+		return a.writable == b.0 && a.elemType == b.1;
+	}
+	def make(hash: u32, b: (bool, Type)) -> RangeType {
+		return RangeType.new(hash, b.0, b.1);
+	}
+}
+
+// Cache for all sequence types "seq<T>".
+component SeqTypeCache {
+	def get = SeqTypeCacheImpl.new().get;
+}
+class SeqTypeCacheImpl extends TypeCache<Type, SeqType> {
+	def hash(elemType: Type) -> u32 {
+		return TypeHash.do1(Kind.SEQ, 0, elemType);
+	}
+	def equal(a: SeqType, b: Type) -> bool {
+		return a.elemType == b;
+	}
+	def make(hash: u32, b: Type) -> SeqType {
+		return SeqType.new(hash, b);
+	}
+}
+
+// Cache for all closure types "A -> B".
+component ClosureTypeCache {
+	def get = ClosureTypeCacheImpl.new().get;
+}
+class ClosureTypeCacheImpl extends TypeCache<Signature, ClosureType> {
+	def hash(sig: Signature) -> u32 {
+		return TypeHash.doMN(Kind.CLOSURE, Kind.CLOSURE.tag, sig.params, sig.results);
+	}
+	def equal(t: ClosureType, sig: Signature) -> bool {
+		return t.sig == sig || (Arrays.equal(t.sig.params, sig.params) && Arrays.equal(t.sig.results, sig.results));
+	}
+	def make(hash: u32, sig: Signature) -> ClosureType {
+		return ClosureType.new(hash, sig);
+	}
+}
+
+// Cache for all internal function (code pointer) types "A ~> B".
+component FuncTypeCache {
+	def get = FuncTypeCacheImpl.new().get;
+}
+class FuncTypeCacheImpl extends TypeCache<Signature, FuncType> {
+	def hash(sig: Signature) -> u32 {
+		return TypeHash.doMN(Kind.FUNC, Kind.FUNC.tag, sig.params, sig.results);
+	}
+	def equal(t: FuncType, sig: Signature) -> bool {
+		return t.sig == sig || (Arrays.equal(t.sig.params, sig.params) && Arrays.equal(t.sig.results, sig.results));
+	}
+	def make(hash: u32, sig: Signature) -> FuncType {
+		return FuncType.new(hash, sig);
+	}
+}
+
+// A cache for a class type {decl}. Note that nullary class types should be cached
+// directly in the decl.
+class ClassTypeCache(decl: VstClass) extends TypeCacheA<ClassType>(Kind.CLASS, u25.view(decl.uid)) {
+	def equal(ct: ClassType, args: Array<Type>) -> bool {
+		return Arrays.equal(ct.typeArgs, args);
+	}
+	def make(hash: u32, args: Array<Type>) -> ClassType {
+		return ClassType.new(hash, decl, args);
+	}
+}
+
+// A cache for a variant type {decl}. Note that nullary variant types should be cached
+// directly in the decl.
+class VariantTypeCache(decl: VstVariant) extends TypeCacheA<VariantType>(Kind.VARIANT, u25.view(decl.uid)) {
+	def equal(vt: VariantType, args: Array<Type>) -> bool {
+		return Arrays.equal(vt.typeArgs, args);
+	}
+	def make(hash: u32, args: Array<Type>) -> VariantType {
+		return VariantType.new(hash, decl, args);
+	}
+}
+
+// A cache for a data type {decl}. Note that nullary data types should be cached
+// directly in the decl.
+class DataTypeCache(decl: VstData) extends TypeCacheA<DataType>(Kind.DATA, u25.view(decl.uid)) {
+	def equal(ct: DataType, args: Array<Type>) -> bool {
+		return Arrays.equal(ct.typeArgs, args);
+	}
+	def make(hash: u32, args: Array<Type>) -> DataType {
+		return DataType.new(hash, decl, args);
+	}
+}
+
+// A cache for a alias type {decl}. Note that nullary alias types should be cached
+// directly in the decl.
+class AliasTypeCache(decl: VstAlias) extends TypeCacheA<AliasType>(Kind.ALIAS, u25.view(decl.uid)) {
+	def make(hash: u32, args: Array<Type>) -> AliasType {
+		var alias = decl.alias;
+		if (args.length > 0) alias = alias.substParams(decl.typeParams, args);
+		return AliasType.new(hash, decl, args, alias);
+	}
+	def typeArgs(ct: AliasType) -> Array<Type> {
+		return ct.typeArgs;
+	}
+}
+
+// A hash-based cache for types. This is essentially a memoization of a type constructor
+// applied to argument types. Subclasses override the {hash}, {equal} and {make} methods
+// in order to construct specific kinds of types.
+def INITIAL_SIZE = 4;
+def TABLE_FACTOR = 4;
+def trace = false; // TODO: remove
+class TypeCache<A, T /*extends Type*/> {
+	var vals = Array</*weak*/ T>.new(INITIAL_SIZE);
+	var table = Array<u32>.new(INITIAL_SIZE * TABLE_FACTOR);
+	var pos: u32;
+	var mask = u32.view(INITIAL_SIZE * TABLE_FACTOR - 1);
+	var shift: u5 = 3;
+	def get(args: A) -> T {
+		var h = hash(args);
+		if (trace) System.puts("hash ");
+		if (trace) System.puti(int.view(h));
+		var start = h & mask, i = start;
+		// XXX: one-element cache for last hit index?
+		while (true) {
+			if (trace) System.putc(' ');
+			if (trace) System.puti(int.view(i));
+			var entry = table[i];
+			if ((entry & 1) != 0) { // occupied entry, check for match
+				var v = vals[entry >> 1], t = Type.!(v);
+				if (t.hash == h && equal(v, args)) return v;
+			} else if (pos == vals.length) { // empty entry, but at capacity
+				grow();
+				i = h & mask;
+				continue;  // restart the search with new table geometry
+			} else { // empty entry and not at capacity
+				var v = make(h, args);
+				table[i] = (pos << 1) | 1u;
+				vals[pos++] = v;
+				return v;
+			}
+			i = (i + 1) & mask;
+			if (i == start) break;
+		}
+		// Because {table} is at least 4x {vals}, it should have at least one free entry
+		System.error("Unreachable", "TypeCache.table inexplicably full");
+		var d: T;
+		return d;
+	}
+	def grow() {
+		var ovals = vals;
+		vals = Array.new(ovals.length * 2);
+		table = Array.new(table.length * 2);
+		mask = (mask << 1) | 0x1u;
+		for (j < u32.view(ovals.length)) { // reinsert all existing vals
+			var v = ovals[j], t = Type.!(v), h = t.hash;
+			vals[j] = v;
+			if (trace) System.puti(int.view(j));
+			if (trace) System.putc(' ');
+			if (trace) System.puti(int.view(h));
+			for (i < j + 1) { // find the next free slot in the table
+				var k = (h + i) & mask;
+				if (trace) System.putc(' ');
+				if (trace) System.puti(int.view(k));
+				var entry = table[k];
+				if (entry == 0) {
+					if (trace) System.puts(" set ");
+					if (trace) System.puts(t.render(StringBuilder.new()).toString());
+					if (trace) System.ln();
+					table[k] = (j << 1) | 1;
+					break;
+				}
+			}
+
+		}
+	}
+	def hash(args: A) -> u32; // subclass must override
+	def equal(t: T, args: A) -> bool; // subclass must override
+	def make(hash: u32, args: A) -> T; // subclass must override
+}
+class TypeCacheA</*weak*/ T>(kind: Kind, salt: u25) extends TypeCache<Array<Type>, T> {
+	def hash(args: Array<Type>) -> u32 {
+		return TypeHash.doN(kind, salt, args);
+	}
+}

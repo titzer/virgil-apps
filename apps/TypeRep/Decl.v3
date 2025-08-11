@@ -1,0 +1,118 @@
+// Copyright 2020 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+component Uid {
+	var uid: u32;
+}
+
+class AddressSpace {
+}
+class Decl {
+	def uid = Uid.uid++;
+	def render(buf: StringBuilder) -> StringBuilder {
+		return buf.putd(int.view(uid)); // TODO
+	}
+}
+class VstClass extends Decl {
+	def typeParams: Array<TypeParamType>;
+	def superClass: ClassType;
+	def depth: int = if(superClass != null, 1 + superClass.decl.depth);
+	private var type0: ClassType;
+	private var cache: ClassTypeCache;
+
+	new(typeParams, superClass) { }
+
+	def getCachedType(typeArgs: Array<Type>) -> ClassType {
+		if (typeArgs.length == 0) {
+			if (type0 != null) return type0;
+			var hash = TypeHash.do0(Kind.CLASS, u25.view(uid));
+			return type0 = ClassType.new(hash, this, typeArgs);
+		}
+		if (cache == null) cache = ClassTypeCache.new(this);
+		return cache.get(typeArgs);
+	}
+	def name() -> string;
+}
+class VstComponent extends Decl {
+	private var type0: ComponentType;
+	
+	def name() -> string;
+	def getCachedType() -> ComponentType {
+		if (type0 == null) type0 = ComponentType.new(this);
+		return type0;
+	}
+}
+class VstVariant extends Decl {
+	def typeParams: Array<TypeParamType>;
+	def cases: Array<VstCaseMember>;
+	private var type0: VariantType;
+	private var cache: VariantTypeCache;
+
+	new(typeParams, cases) { }
+	def getCachedType(typeArgs: Array<Type>) -> VariantType {
+		if (typeArgs.length == 0) {
+			if (type0 != null) return type0;
+			var hash = TypeHash.do0(Kind.CLASS, u25.view(uid));
+			return type0 = VariantType.new(hash, this, typeArgs);
+		}
+		if (cache == null) cache = VariantTypeCache.new(this);
+		return cache.get(typeArgs);
+	}
+	def name() -> string;
+}
+class VstCaseMember extends Decl {
+	def decl: VstVariant;
+	def index: int;
+	new(decl, index) { }
+}
+class VstData extends Decl {
+	def typeParams: Array<TypeParamType>;
+	private var type0: DataType;
+	private var cache: DataTypeCache;
+
+	new(typeParams) { }
+
+	def getCachedType(typeArgs: Array<Type>) -> DataType {
+		if (typeArgs.length == 0) {
+			if (type0 != null) return type0;
+			var hash = TypeHash.do0(Kind.DATA, u25.view(uid));
+			return type0 = DataType.new(hash, this, typeArgs);
+		}
+		if (cache == null) cache = DataTypeCache.new(this);
+		return cache.get(typeArgs);
+	}
+	def name() -> string;
+}
+class VstEnum extends Decl {
+	def cases: Array<void>;
+}
+class Signature(params: Array<Type>, results: Array<Type>) {
+	private var paramT: Type;
+	private var returnT: Type;
+
+	def paramType() -> Type {
+		if (paramT == null) paramT = TupleTypeCache.get(params);
+		return paramT;
+	}
+	def returnType() -> Type {
+		if (returnT == null) returnT = TupleTypeCache.get(results);
+		return returnT;
+	}
+}
+class VstAlias extends Decl {
+	def typeParams: Array<TypeParamType>;
+	def alias: Type;
+	private var type0: AliasType;
+	private var cache: AliasTypeCache;
+
+	new(typeParams, alias) { }
+	def getCachedType(typeArgs: Array<Type>) -> AliasType {
+		if (typeArgs.length == 0) {
+			if (type0 != null) return type0;
+			var hash = TypeHash.do0(Kind.CLASS, u25.view(uid));
+			return type0 = AliasType.new(hash, this, typeArgs, alias);
+		}
+		if (cache == null) cache = AliasTypeCache.new(this);
+		return cache.get(typeArgs);
+	}
+}

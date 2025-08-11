@@ -1,0 +1,49 @@
+class Printer(str: string, out: string -> void) {
+	def run() {
+		for (i < 1000) {
+			out(str);
+			for (j < 1000000) ;
+		}
+	}
+}
+
+var print1 = Printer.new("#1 ", System.puts);
+var print2 = Printer.new("#2 ", System.puts);
+var print3 = Printer.new("#3 ", System.puts);
+
+def SYS_clone = 120;
+def CLONE_VM = 0x00000100;
+def CLONE_SIGHAND = 0x00000800;
+def CLONE_PARENT = 0x00008000;
+def CLONE_THREAD = 0x00010000;
+
+var func: void -> void;
+
+def stack1 = Array<int>.new(1024); // TODO: dangerous, stack is in heap!
+def stack2 = Array<int>.new(1024); // TODO: dangerous, stack is in heap!
+var tid_buf = Array<int>.new(4);
+
+def clone(f: void -> void, stack: Array<int>) {
+	func = f;
+	var t = Linux.syscall(SYS_clone,
+		(CLONE_VM | CLONE_SIGHAND | CLONE_PARENT | CLONE_THREAD,
+		Pointer.atEnd(stack),
+		Pointer.atElement(tid_buf, 0),
+		0x11223344,
+		Pointer.atElement(tid_buf, 1)));
+	if (t.0 < 0) System.error("ThreadError", "Linux.syscall(SYS_clone) failed.");
+	if (t.0 == 0) {
+		f = func;
+		func = null;
+		f();
+		Linux.syscall(LinuxConst.SYS_exit, 0);
+	} else {
+		// TODO: can only spawn one thread at a time due to global func
+		while (func != null);
+	}
+}
+def main() {
+	clone(print2.run, stack1);
+	clone(print3.run, stack2);
+	print1.run();
+}

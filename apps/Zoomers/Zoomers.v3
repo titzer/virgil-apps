@@ -1,0 +1,516 @@
+// Copyright 2013 Google Inc. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def MAX_X = 128;	// width of the board
+def MAX_Y = 50;		// height of the board
+def STATES = 7;		// number of states per genome
+def ONE = '\x01';	// 1 as a byte
+def POP_SIZE = 150;
+def FRAMES_PER_GEN = 1000;
+def INITIAL_PLANTS = 750;
+def HEALTH_BOOST = 30;
+def INITIAL_HEALTH = 100;
+def MAX_HEALTH = 5 * INITIAL_HEALTH;
+def RESPAWN_INTERVAL = 16;
+def T: Vt100;
+def FAMILY_SIZE = 5;
+
+def directions = [Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT];
+def actions = [Action.FORWARD, Action.LEFT_TURN, Action.RIGHT_TURN];
+def situations = [Situation.SPACE, Situation.WALL, Situation.PLANT, Situation.ZOOMER];
+def turnLeft = [Direction.LEFT, Direction.UP, Direction.RIGHT, Direction.DOWN];
+def turnRight = [Direction.RIGHT, Direction.DOWN, Direction.LEFT, Direction.UP];
+def fwDelta = [0 - MAX_X, 1, MAX_X, -1];
+def chars = "^>v<";
+
+type Direction {
+	case UP;
+	case RIGHT;
+	case DOWN;
+	case LEFT;
+}
+
+type Action {
+	case FORWARD;
+	case LEFT_TURN;
+	case RIGHT_TURN;
+}
+
+type Situation {
+	case SPACE;
+	case WALL;
+	case PLANT;
+	case ZOOMER;
+}
+
+// Represents the genetic material of a zoomer.
+class Genome(states: int) {
+	def data = Array<(Action, u4)>.new(states * situations.length);
+	var str: Array<byte>; // a cache for toString()
+	// perform a crossover mutation
+	def cross(that: Genome) -> Genome {
+		var child = Genome.new(states);
+		var point = Random.random(data.length);
+		for (i < point) child.data[i] = this.data[i];
+		for (i = point; i < data.length; i++) child.data[i] = that.data[i];
+		return child;
+	}
+	// generate a complete random genome.
+	def randomize() {
+		mutate(1000000);
+	}
+	// mutate the genes of this genome with the given probability / 1000000
+	def mutate(prob: int) {
+		if (prob <= 0) return;
+		str = null; // toString() is invalid
+		for (i < data.length) {
+			if (Random.flip(prob, 1000000)) {
+				var b = data[i];
+				var a = newAction(b.0, Random.random(4));
+				var s = newState(b.1, Random.random(states + 2));
+				data[i] = (a, u4.!(s));
+			}
+		}
+	}
+	// get the action and the next state for the given situation
+	def get(state: int, situation: Situation) -> (Action, u4) {
+		return data[state * situations.length + situation.tag];
+	}
+	// returns an exact copy of this genome.
+	def copy() -> Genome {
+		var g = Genome.new(states);
+		for (i < data.length) g.data[i] = data[i];
+		return g;
+	}
+	def newState(prev: u4, rand: int) -> int {
+		if (rand < 0) return 0;
+		if (rand < states) return u4.!(prev + rand) % states;
+		if (rand == states) return u4.!(prev - 1) % states;
+		return u4.!(prev + 1) % states;
+	}
+	def newAction(prev: Action, rand: int) -> Action {
+		return actions[(prev.tag ^ rand) % actions.length];
+	}
+	def toString() -> string {
+		if (str == null) {
+			str = Array<byte>.new(data.length * 2);
+			for (i < data.length) {
+				var b = data[i];
+				str[i * 2] = byte.!('0' + b.1);
+				str[i * 2 + 1] = b.0.name[0];
+			}
+		}
+		return str;
+	}
+}
+
+// Represents an instance of a zoomer on the board.
+class Zoomer(genome: Genome) {
+	var pos: (byte, byte);
+	var dir: Direction;
+	var state: byte;
+	var score: int;
+	var health = INITIAL_HEALTH;
+
+	def front() -> (byte, byte) {
+		var x = pos.0, y = pos.1;
+		match (dir) {
+			LEFT => return (x - ONE, y);
+			RIGHT => return (x + ONE, y);
+			UP => return (x, y - ONE);
+			DOWN => return (x, y + ONE);
+		}
+	}
+	def compare(that: Zoomer) -> bool { return this.score > that.score; }
+	def age() -> int {
+		return if(health < 0, 0 - health, FRAMES_PER_GEN);
+	}
+}
+
+class Family(genome: Genome) {
+	def zoomers = Array<Zoomer>.new(FAMILY_SIZE);
+	new() {
+		for (i < zoomers.length) zoomers[i] = Zoomer.new(genome);
+	}
+	def maxAge() -> int {
+		var max = 0;
+		for (z in zoomers) if (z.age() > max) max = z.age();
+		return max;
+	}
+	def maxScore() -> int {
+		var max = 0;
+		for (z in zoomers) if (z.score > max) max = z.score;
+		return max;
+	}
+	def medianScore() -> int {
+		var z = Arrays.sort(zoomers, 0, zoomers.length, Zoomer.compare);
+		return z[z.length / 2].score;
+	}
+	def compare(that: Family) -> bool {
+		return this.maxAge() > that.maxAge() ||
+		       this.medianScore() > that.medianScore();
+	}
+}
+
+class Population(size: int, color: void -> void) {
+	def families = Array<Family>.new(size / FAMILY_SIZE);
+	var count: int;
+
+	def random() {
+		for (i < families.length) {
+			if (families[i] != null) continue;
+			var g = Genome.new(STATES);
+			g.randomize();
+			families[i] = Family.new(g);
+		}
+		count = size / FAMILY_SIZE * FAMILY_SIZE;
+	}
+	def rank(y: int, max: int) {
+		var ranking = Arrays.sort(families, 0, families.length, Family.compare);
+		for (i < ranking.length) {
+			if (i >= max) break;
+			var f = ranking[i];
+			T.moveCursor(i + 2 + y, MAX_X + 4);
+			color();
+			T.puts(f.genome.toString());
+			T.fgNorm();
+			T.putc(' ');
+			T.puti(f.medianScore());
+			T.putc(',');
+			T.puti(f.maxAge());
+			T.eraseToEndOfLine();
+		}
+		var i = 0, j = 0;
+		{
+			var f = ranking[i];
+			families[j++] = Family.new(f.genome.copy());
+		}
+
+		while (i < 1*(ranking.length / 4)) {
+			var f = ranking[i];
+			families[j++] = f;
+			f.genome.mutate(3000);
+			i++;
+		}
+		while (i < 2*(ranking.length / 4)) {
+			var f = ranking[i];
+			families[j++] = f;
+			f.genome.mutate(5000);
+			i++;
+		}
+		while (i < 3*(ranking.length / 4)) {
+			var f = ranking[i];
+			families[j++] = f;
+			f.genome.mutate(25000);
+			i++;
+		}
+		while (j < families.length) {
+			var g = Genome.new(STATES);
+			g.randomize();
+			families[j++] = Family.new(g);
+			j++;
+		}
+		count = size / FAMILY_SIZE * FAMILY_SIZE;
+	}
+}
+
+// State of the board for each grid location.
+class Board {
+	def red = Population.new(POP_SIZE / 3, T.fgBrightRed);
+	def blue = Population.new(POP_SIZE / 3, T.fgBrightBlue);
+	def yellow = Population.new(POP_SIZE / 3, T.fgYellow);
+	def pops = [red, blue, yellow];
+	var view = true;
+	var plants: int;
+	def grid = Array<Situation>.new(MAX_X * MAX_Y);
+
+	def set(pos: (byte, byte), s: Situation) {
+		grid[pos.1 * MAX_X + pos.0] = s;
+	}
+	def get(pos: (byte, byte)) -> Situation {
+		return grid[pos.1 * MAX_X + pos.0];
+	}
+	def init() {
+		for (pop in pops) {
+			pop.random();
+			placeZoomers(pop);
+		}
+		ensurePlants(INITIAL_PLANTS);
+	}
+	def rank() {
+		clear();
+		var y = 0, max = MAX_Y / pops.length;
+		for (pop in pops) {
+			pop.rank(y, max);
+			placeZoomers(pop);
+			y = y + max;
+		}
+		ensurePlants(INITIAL_PLANTS);
+	}
+	def printFull() {
+		if (view) {
+			printBoard();
+			for (pop in pops) {
+				pop.color();
+				for (f in pop.families) for (z in f.zoomers) draw(z);
+			}
+		}
+	}
+	def placeZoomers(pop: Population) {
+		for (f in pop.families) for (z in f.zoomers) {
+			z.dir = directions[Random.random(directions.length)];
+			z.score = 0;
+			z.health = INITIAL_HEALTH;
+			while (true) {
+				z.pos = (byte.!(Random.random(MAX_X)), byte.!(Random.random(MAX_Y)));
+				if (get(z.pos) != Situation.ZOOMER) {
+					set(z.pos, Situation.ZOOMER);
+					break;
+				}
+			}
+		}
+	}
+
+	def move(z: Zoomer, npos: (byte, byte)) {
+		putc(' ', z.pos);
+		set(z.pos, Situation.SPACE);
+		var nindex = npos.1 * MAX_X + npos.0;
+		if (grid[nindex] == Situation.PLANT) {
+			plants--;
+			z.health = z.health + HEALTH_BOOST;
+			if (z.health > MAX_HEALTH) z.health = MAX_HEALTH;
+			z.score++;
+		}
+		grid[nindex] = Situation.ZOOMER;
+		z.pos = npos;
+		draw(z);
+	}
+	def step(frame: int) {
+		for (pop in pops) stepPop(pop, frame);
+	}
+	def count() -> int {
+		var count = 0;
+		for (pop in pops) count = count + pop.count;
+		return count;
+	}
+	def stepPop(pop: Population, frame: int) {
+		if (view) pop.color();
+		for (f in pop.families)
+		for (z in f.zoomers) {
+			if (z.health < 0) continue; // dead
+			stepOne(z);
+			if (z.health == 0) { // died
+				pop.count--;
+				z.health = 0 - frame;
+				putc('x', z.pos);
+				set(z.pos, Situation.SPACE);
+			}
+		}
+	}
+	def stepOne(z: Zoomer) {
+		var fw = z.front();
+		var s = situation(fw);
+		var b = z.genome.get(z.state, s);
+		z.state = b.1;
+		match (b.0) {
+			FORWARD => {
+				if (s == Situation.SPACE) move(z, fw);
+				if (s == Situation.PLANT) move(z, fw);
+			}
+			LEFT_TURN => { z.dir = turnLeft[z.dir.tag]; draw(z); }
+			RIGHT_TURN => { z.dir = turnRight[z.dir.tag]; draw(z); }
+		}
+		z.health--;
+	}
+	def clear() {
+		for (i < grid.length) grid[i] = Situation.SPACE;
+		plants = 0;
+	}
+	def situation(x: byte, y: byte) -> Situation {
+		if (x >= MAX_X) return Situation.WALL;
+		if (y >= MAX_Y) return Situation.WALL;
+		return grid[y * MAX_X + x];
+	}
+	def draw(z: Zoomer) {
+		if (view) putc(chars[z.dir.tag], z.pos);
+	}
+	def ensurePlants(goal: int) {
+		while (plants < goal) {
+			var index = Random.random(grid.length), end = index + 8;
+			if (end > grid.length) end = grid.length;
+			while (index < end && grid[index] == Situation.SPACE) {
+				grid[index] = Situation.PLANT;
+				index++;
+				plants++;
+			}
+		}
+	}
+	def spawnPlants(num: int) {
+		// spawn new plants and also print them.
+		if (view) T.fgGreen();
+		var goal = plants + num;
+		while (plants < goal) {
+			var index = Random.random(grid.length), end = index + 8;
+			if (end > grid.length) end = grid.length;
+			while (index < end && grid[index] == Situation.SPACE) {
+				grid[index] = Situation.PLANT;
+				putIndex('o', index);
+				index++;
+				plants++;
+			}
+		}
+		if (view) T.fgRed();
+	}
+	def printBoard() {
+		var buf = Array<byte>.new(MAX_X);
+		T.fgGreen();
+		for (y < MAX_Y) {
+			for (x < MAX_X) {
+				var c = ' ';
+				match (grid[y * MAX_X + x]) {
+					SPACE => c = ' ';
+					ZOOMER => c = '.'; // temporary
+					PLANT => c = 'o';
+					WALL =>  c = 'w';  // shouldn't happen
+				}
+				buf[x] = c;
+			}
+			T.moveCursor(y + 2, 2);
+			T.puts(buf);
+		}
+	}
+	def putc(c: byte, pos: (byte, byte)) {
+		if (view) {
+			T.moveCursor(pos.1 + 2, pos.0 + 2);
+			T.putc(c);
+		}
+	}
+	def putIndex(c: byte, index: int) {
+		if (view) {
+			T.moveCursor(2 + index / MAX_X, 2 + index % MAX_X);
+			T.putc(c);
+		}
+	}
+}
+
+def speeds: Array<u32> = [1, 2, 5, 10, 15, 20, 30, 45, 60, 90, 120, 240, 500, 1000, 500000];
+class Simulation {
+	def board = Board.new();
+	var frame = 0;
+	var gen = 0;
+	var animator: Animator;
+	var speed = 8;
+	new() {
+		animator = Animator.new(animate, keypress);
+		animator.setFPS(speeds[speed]);
+	}
+	def init() {
+		board.init();
+	}
+	def addGenome(g: Genome) {
+		var p = board.pops[0];
+		var size = board.pops[0].families.length;
+		for (i < size) {
+			for (j = 0; j < board.pops.length; j++) {
+				if (board.pops[j].families[i] == null) {
+					board.pops[j].families[i] = Family.new(g);
+					return;
+				}
+			}
+		}
+	}
+	def animate(us: u32) {
+		if (frame == 0) board.printFull();
+		board.step(frame + 1);
+		printStatus(board, gen + 1, frame + 1);
+		if (board.count() <= 0) frame = FRAMES_PER_GEN;
+		if (((frame + 1) % RESPAWN_INTERVAL) == 0) {
+			board.spawnPlants((INITIAL_PLANTS - board.plants) / 2);
+		}
+		if (++frame >= FRAMES_PER_GEN) {
+			board.rank();
+			frame = 0;
+			gen++;
+		}
+	}
+	def setSpeed(s: int) {
+		if (s < 0) s = 0;
+		if (s >= speeds.length) s = speeds.length - 1;
+		animator.setFPS(speeds[speed = s]);
+	}
+	def keypress(ch: int) {
+		if (ch == 'j') setSpeed(speed - 1);
+		if (ch == 'k') setSpeed(speed + 1);
+		if (ch == 'v') board.view = !board.view;
+	}
+	// Print a status line, containing information on the board.
+	def printStatus(board: Board, gen: int, frame: int) {
+		T.moveCursor(MAX_Y + 3, 0);
+		T.fgNorm();
+		T.puts(" gen ");
+		T.puti(gen);
+		T.puts("  frame ");
+		T.puti(frame);
+		T.puts("  pop ");
+		T.puti(board.count());
+		T.puts("  fps ");
+		T.puti(int.!(animator.fps));
+		T.puts("  cpu ");
+		T.puti(int.!(animator.cpu / 10));
+		T.putc('.');
+		T.puti(int.!(animator.cpu % 10));
+		T.puts("%  ");
+		T.puti(GcStats.gc_count);
+		T.puts(" gc (");
+		var avg = if(GcStats.gc_count > 0, GcStats.collection_us / GcStats.gc_count);
+		T.puti(int.!(avg));
+		T.puts(" us avg) ");
+		T.puti(int.!(GcStats.total_allocated_bytes()));
+		T.puts(" bytes");
+		T.eraseToEndOfLine();
+		T.ln();
+	}
+}
+
+def parseGenome(a: string) -> Genome {
+	var state_len = (2 * situations.length);
+	if (a.length % state_len != 0) return null;
+	var g = Genome.new(a.length / state_len);
+	for (i = 0; i < a.length / 2; i++) {
+		var next_state = a[i * 2] - '0';
+		if (next_state > g.states) return null;
+		var found = false;
+		for (action in actions) {
+			if (action.name[0] == a[i * 2 + 1]) {
+				found = true;
+				g.data[i] = (action, u4.!(next_state));
+			}
+		}
+		if (!found) return null;
+	}
+	return g;
+}
+
+// Main entrypoint. Create the zoomers and run the simulation.
+def main(args: Array<string>) {
+	var sim = Simulation.new();
+	T.eraseScreen();
+	for (a in args) {
+		var g = parseGenome(a);
+		if (g == null) System.error("Invalid Genome", a);
+		sim.addGenome(g);
+	}
+	RawStdin.enable();
+	T.hideCursor();
+	T.drawBox(1, 1, MAX_X, MAX_Y);
+	T.ln();
+	T.ln();
+
+	sim.init();
+	sim.animator.run();
+	RawStdin.restore();
+	T.moveCursor(MAX_Y + 4, 0);
+	T.showCursor();
+}
+
+

@@ -1,0 +1,101 @@
+class VarExpr { def name: string; }
+class VarDecl { }
+class VstField { }
+class VstMethod { }
+class Operator { }
+class Val { }
+class TypeArgs { }
+enum Fact { X }
+class VstNew { }
+enum InfixOp { PLUS }
+// The possible shapes that bindings can take for these expressions:
+// "Type.name"
+// "expr.name"
+type VarBinding {
+	case None;
+	// read/write bindings
+	case Local(decl: VarDecl);
+	case ObjectField(receiver: Type, member: VstField);
+	case ComponentField(member: VstField);
+	// read-only bindings
+	case Const(val: Val, vtype: Type);
+	case Type(t: Type);
+	case ObjectMethod(receiver: Type, member: VstMethod, typeArgs: TypeArgs);
+	case ClassMethod(receiver: Type, member: VstMethod, typeArgs: TypeArgs);
+	case ClassField(receiver: Type, member: VstField);
+	case ClassNew(receiver: Type, member: VstNew, funcType: Type);
+	case ComponentMethod(member: VstMethod, typeArgs: TypeArgs);
+	case VariantCase(receiver: Type, member: VstCaseMember);
+	case VariantField(receiver: Type, member: VstField);
+	case EnumConst(member: VstCaseMember);
+	case Inst(op: Operator, facts: Fact.set);		// instantiate {op}
+	case Apply(op: Operator, facts: Fact.set);		// apply {op} to receiver
+	case Partial(op: Operator, facts: Fact.set);		// partially apply {op} to receiver
+
+	def none() -> bool { return this.tag == 0; }
+	def ok() -> bool { return this.tag != 0; }
+}
+
+component Resolution {
+	def lookupExprMember(expr: VarExpr, etype: Type, useThis: bool) -> VarBinding {
+		var n = expr.name;
+		match (etype) {
+			x: FloatType => {
+				if (Strings.equal("sign", n)) ;
+				if (Strings.equal("exponent", n)) ;
+				if (Strings.equal("fraction", n)) ;
+			}
+			x: ArrayType => {
+				if (Strings.equal("length", n)) ;
+			}
+			x: ComponentType => ;
+			x: ClassType => ;
+			x: VariantType => ;
+			x: VariantCaseType => ;
+			x: TupleType => ;
+			x: EnumType => ;
+			x: EnumSetType => ;
+			x: AliasType => ;
+			x: PointerType => ;
+			_ => return VarBinding.None;
+		}
+		return VarBinding.None;
+	}
+	def lookupTypeMember(expr: VarExpr, etype: Type, useThis: bool) -> VarBinding {
+		var n = expr.name;
+		match (etype) {
+			x: IntType => {
+				if (Strings.equal("max", n)) ;
+				if (Strings.equal("min", n)) ;
+			}
+			x: FloatType => {
+				if (Strings.equal("view", n)) ;
+				if (Strings.equal("nan", n)) ;
+				if (Strings.equal("infinity", n)) ;
+				if (Strings.equal("roundi", n)) ;
+				if (Strings.equal("round", n)) ;
+				if (Strings.equal("roundd", n)) ;
+				if (Strings.equal("abs", n)) ;
+				if (Strings.equal("ceil", n)) ;
+				if (Strings.equal("floor", n)) ;
+				if (Strings.equal("sqrt", n)) ;
+				// TODO: operators
+			}
+			x: ArrayType => ;
+			x: ComponentType => ;
+			x: ClassType => ;
+			x: VariantType => ;
+			x: VariantCaseType => ;
+			x: TupleType => ;
+			x: EnumType => ;
+			x: EnumSetType => ;
+			x: AliasType => ;
+			x: PointerType => ;
+			_ => return VarBinding.None;
+		}
+		return VarBinding.None;
+	}
+	def lookupInfix(op: InfixOp, left: Type, right: Type) -> Operator {
+		return null;
+	}
+}

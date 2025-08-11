@@ -1,0 +1,568 @@
+// Copyright 2020 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def T = UnitTests.registerT("type:", _, TypeTester.new, _);
+def X = [
+	T("prims", test_prims),
+	T("promote", test_promote),
+	T("assign", test_assign),
+	T("int_array", test_int_array),
+	T("float", test_float),
+	T("null_array", test_null_array),
+	T("tuple1", test_tuple1),
+	T("tuple2", test_tuple2),
+	T("class1", test_class1),
+	T("class2", test_class2),
+	T("closure1", test_closure1),
+	T("subst1", test_subst1),
+	T("subst2", test_subst2),
+	T("common1", test_common1),
+	T("maybe1", test_maybe1),
+	T("cast1", test_cast1),
+	T("cast_class1", test_cast_class1),
+	T("cast_class2", test_cast_class2),
+	T("cast_tuple", test_cast_tuple),
+	T("subtype_indexed", test_subtype_indexed),
+	T("promote_indexed", test_promote_indexed),
+	T("alias1", test_alias1),
+	()
+];
+
+class TypeTester(t: Tester) {
+	def assertSubtype(expected: bool, src: Type, dst: Type) {
+		if (expected != TypeSystem.isSubtype(src, dst)) {
+			t.fail3("expected %z == isSubtype(%q, %q)", expected, safeRender(src), safeRender(dst));
+		}
+	}
+	def assertPromotable(expected: bool, src: Type, dst: Type) {
+		if (expected != TypeSystem.isPromotable(src, dst)) {
+			t.fail3("expected %z == isPromotable(%q, %q)", expected, safeRender(src), safeRender(dst));
+		}
+	}
+	def assertAssignable(expected: bool, src: Type, dst: Type) {
+		if (expected != TypeSystem.isAssignable(src, dst)) {
+			t.fail3("expected %z == isAssignable(%q, %q)", expected, safeRender(src), safeRender(dst));
+		}
+	}
+	def assertUnrelated(a: Type, b: Type) {
+		assertNotEqual(a, b);
+		assertSubtype(false, a, b);
+		assertSubtype(false, b, a);
+		assertPromotable(false, a, b);
+		assertPromotable(false, b, a);
+		assertAssignable(false, a, b);
+		assertAssignable(false, b, a);
+	}
+	def assertUnrelatedA(at: Array<Type>) {
+		for (a in at) {
+			for (b in at) {
+				if (a == b) continue;
+				assertUnrelated(a, b);
+			}
+		}
+	}
+	def assertUnrelated1(a: Type, at: Array<Type>) {
+		for (b in at) {
+			assertUnrelated(a, b);
+		}
+	}
+	def assertCovariant(a: Type, b: Type, ta: Type, tb: Type) {
+		if (a == b) return;
+		var suba = TypeSystem.isSubtype(ta, tb), subb = TypeSystem.isSubtype(tb, ta);
+		assertSubtype(suba, a, b);
+		assertSubtype(subb, b, a);
+		if (!suba && !subb) assertUnrelated(a, b);
+	}
+	def assertEqual(a: Type, b: Type) {
+		if (a != b) t.fail2("expected %q == %q", safeRender(a), safeRender(b));
+	}
+	def assertNotEqual(a: Type, b: Type) {
+		if (a == b) t.fail2("expected %q != %q", safeRender(a), safeRender(b));
+	}
+	def assertCast(expected: TypeCast, a: Type, b: Type) {
+		var got = TypeSystem.newTypeCast(a, b, false);
+		if (expected != got) t.fail(StringBuilder.new()
+			.put2("expected cast from %q to %q", a.render, b.render)
+			.put2(" == %s, got %s", expected.name, got.name).toString());
+	}
+	def assertCasts(expected: Array<TypeCast>, a: Type, b: Type) {
+		var got = TypeSystem.newTypeCast(a, b, false);
+		/* TODO recursive check of tuple casts
+		if (!TypeCast.TupleCast.?(got)) return t.fail3("expected tuple cast from %q to %q, got %s", a.render, b.render, got.name);
+		t.asserta("cast", expected, TypeCast.TupleCast.!(got).sub, renderCast);
+		*/
+	}
+	def renderCast(buf: StringBuilder, t: TypeCast) -> StringBuilder {
+		return buf.puts(t.name);
+	}
+	def safeRender(t: Type) -> StringBuilder -> StringBuilder {
+		if (t == null) return StringBuilder.puts(_, "<null>");
+		return t.render;
+	}
+}
+
+def N: Array<Type> = [];
+def NP: Array<TypeParamType> = [];
+
+def INT = IntTypeCache.get(true, 32);
+def BYTE = IntTypeCache.get(false, 8);
+def LONG = IntTypeCache.get(true, 64);
+def BOOL = GlobalTypeCache.BOOL;
+def VOID = GlobalTypeCache.VOID;
+
+def ARRAY_INT = ArrayTypeCache.get(INT);
+def ARRAY_BYTE = ArrayTypeCache.get(BYTE);
+def ARRAY_LONG = ArrayTypeCache.get(LONG);
+def ARRAY_BOOL = ArrayTypeCache.get(BOOL);
+def ARRAY_VOID = ArrayTypeCache.get(VOID);
+
+def FLOAT = FloatTypeCache.FLOAT;
+def DOUBLE = FloatTypeCache.DOUBLE;
+
+def PRIMS = [INT, BYTE, LONG, BOOL, FLOAT, DOUBLE];
+
+def ARRAY_FLOAT = ArrayTypeCache.get(FLOAT);
+def ARRAY_DOUBLE = ArrayTypeCache.get(DOUBLE);
+
+def NULL = GlobalTypeCache.NULL;
+def INT_INT = TupleTypeCache.get([INT, INT]);
+def INT_VOID = TupleTypeCache.get([INT, VOID]);
+def BYTE_BYTE = TupleTypeCache.get([BYTE, BYTE]);
+def FLOAT_INT = TupleTypeCache.get([FLOAT, INT]);
+def FLOAT_DOUBLE = TupleTypeCache.get([FLOAT, DOUBLE]);
+
+def test_prims(t: TypeTester) {
+	t.assertSubtype(false, INT, BYTE);
+	t.assertSubtype(false, BYTE, INT);
+	t.assertSubtype(false, INT, LONG);
+	t.assertSubtype(false, LONG, INT);
+}
+
+def test_promote(t: TypeTester) {
+	t.assertPromotable(false, INT, BYTE);
+	t.assertPromotable(false, LONG, BYTE);
+	t.assertPromotable(false, LONG, INT);
+	t.assertPromotable(true,  BYTE, INT);
+	t.assertPromotable(true,  BYTE, LONG);
+	t.assertPromotable(true,  INT, LONG);
+}
+
+def test_assign(t: TypeTester) {
+	t.assertAssignable(false, INT, BYTE);
+	t.assertAssignable(false, LONG, BYTE);
+	t.assertAssignable(false, LONG, INT);
+	t.assertAssignable(true,  BYTE, INT);
+	t.assertAssignable(true,  BYTE, LONG);
+	t.assertAssignable(true,  INT, LONG);
+}
+
+def test_int_array(t: TypeTester) {
+	// Integer arrays
+	t.assertUnrelatedA([INT, BOOL, VOID]);
+	t.assertUnrelatedA([INT, VOID, BOOL, ARRAY_INT, ARRAY_BOOL, ARRAY_VOID]);
+}
+
+def test_float(t: TypeTester) {
+	t.assertPromotable(true, FLOAT, DOUBLE);
+	t.assertPromotable(false, DOUBLE, FLOAT);
+	t.assertPromotable(true, BYTE, FLOAT);
+	t.assertPromotable(true, BYTE, DOUBLE);
+
+	t.assertUnrelatedA([INT, FLOAT, VOID, ARRAY_FLOAT, ARRAY_DOUBLE]);
+}
+
+def test_null_array(t: TypeTester) {
+	// Null and arrays
+	t.assertSubtype(true, NULL, ARRAY_FLOAT);
+	t.assertSubtype(true, NULL, ARRAY_VOID);
+	t.assertSubtype(false, ARRAY_FLOAT, NULL);
+	t.assertSubtype(false, ARRAY_VOID, NULL);
+
+	t.assertUnrelated1(NULL, [BYTE, INT, FLOAT, VOID]);
+}
+
+def test_tuple1(t: TypeTester) {
+	t.assertPromotable(true, BYTE_BYTE, INT_INT);
+	t.assertPromotable(false, INT_INT, BYTE_BYTE);
+	t.assertUnrelated1(INT_INT, [INT, VOID, ARRAY_INT, FLOAT, NULL, INT_VOID]);
+}
+
+def out_t(t: Type) {
+	System.puts(t.render(StringBuilder.new()).toString());
+}
+
+def test_tuple2(t: TypeTester) {
+	t.assertEqual(VOID, TupleTypeCache.get(N));
+	for (x in [VOID, INT, BOOL, FLOAT, DOUBLE, INT_INT]) {
+		t.assertEqual(x, TupleTypeCache.get([x]));
+
+		for (y in [VOID, INT, BOOL, FLOAT, INT_INT]) {
+			var xy1 = TupleTypeCache.get([x, y]);
+			var xy2 = TupleTypeCache.get([x, y]);
+			t.assertEqual(xy1, xy2);
+		}
+	}
+}
+
+def test_class1(t: TypeTester) {
+	var A = VstClass.new(NP, null), At = A.getCachedType(N);
+	var B = VstClass.new(NP, At), Bt = B.getCachedType(N);
+	var C = VstClass.new(NP, At), Ct = C.getCachedType(N);
+
+	t.assertSubtype(true,  Bt, At);
+	t.assertSubtype(false, At, Bt);
+	t.assertSubtype(true,  Ct, At);
+	t.assertSubtype(false, At, Ct);
+	t.assertSubtype(false, Bt, Ct);
+	t.assertSubtype(false, Ct, Bt);
+
+	t.assertEqual(A.getCachedType(N), A.getCachedType(N));
+	t.assertEqual(B.getCachedType(N), B.getCachedType(N));
+	t.assertEqual(C.getCachedType(N), C.getCachedType(N));
+}
+
+def test_class2(t: TypeTester) {
+	var P = TypeParamType.new(0), Q = TypeParamType.new(0);
+	var A = VstClass.new([P], null), At = A.getCachedType, AtQ = At([Q]);
+	var B = VstClass.new([Q], AtQ), Bt = B.getCachedType, BtQ = Bt([Q]);
+
+	t.assertSubtype(true,  BtQ, AtQ);
+	t.assertSubtype(false, AtQ, BtQ);
+
+	for (x in [VOID, INT, BOOL, FLOAT, DOUBLE, AtQ, BtQ]) {
+		t.assertEqual(At([x]), At([x]));
+		t.assertEqual(Bt([x]), Bt([x]));
+		t.assertSubtype(false, At([x]), Bt([x]));
+	}
+}
+
+def test_closure1(t: TypeTester) {
+	var INT__INT = ClosureTypeCache.get(Signature.new([INT], [INT]));
+	var BOOL__INT = ClosureTypeCache.get(Signature.new([BOOL], [INT]));
+
+	t.assertUnrelated(INT__INT, BOOL__INT);
+	t.assertAssignable(true, NULL, INT__INT);
+	t.assertAssignable(true, NULL, BOOL__INT);
+}
+
+def test_subst1(t: TypeTester) {
+	var T = TypeParamType.new(0), aT = [T];
+
+	for (x in [INT, BOOL, VOID, ARRAY_BYTE]) {
+		t.assertEqual(x, T.substParams(aT, [x]));
+	}
+
+	var T_T = TupleTypeCache.get([T, T]);
+	var T_INT = TupleTypeCache.get([T, INT]);
+	for (x in [INT, BOOL, VOID, ARRAY_BYTE]) {
+		t.assertEqual(TupleTypeCache.get([x, x]), T_T.substParams(aT, [x]));
+		t.assertEqual(TupleTypeCache.get([x, INT]), T_INT.substParams(aT, [x]));
+	}
+}
+
+def test_subst2(t: TypeTester) {
+	var T = TypeParamType.new(0), U = TypeParamType.new(1), aTU = [T, U];
+	var Ft = ClosureTypeCache.get;
+	var T__U = Ft(Signature.new([T], [U]));
+
+	for (x in [INT, BOOL, VOID, ARRAY_BYTE]) {
+		var T__x = Ft(Signature.new([T], [x]));
+		t.assertEqual(T__x, T__U.substParams(aTU, [T, x]));
+		t.assertEqual(T__x, T__x.substParams(aTU, [T, x]));
+
+		for (y in [FLOAT, DOUBLE]) {
+			var y__x = Ft(Signature.new([y], [x]));
+			t.assertEqual(T__x, T__x.substParams(aTU, [T, y]));
+			t.assertEqual(y__x, T__x.substParams(aTU, [y, y]));
+
+			var x__y = Ft(Signature.new([x], [y]));
+			t.assertEqual(x__y, T__U.substParams(aTU, [x, y]));
+		}
+	}
+}
+
+def test_common1(t: TypeTester) {
+	var P = TypeParamType.new(0), Q = TypeParamType.new(0), R = TypeParamType.new(0);
+	var A = VstClass.new([P], null), At = A.getCachedType;
+	var B = VstClass.new([Q], At([Q])), Bt = B.getCachedType;
+	var C = VstClass.new([R], At([R])), Ct = C.getCachedType;
+	var X = VstClass.new(NP, null), Xt = X.getCachedType(N);
+
+	for (x in [INT, VOID]) {
+		var ax = [x];
+		var ct = TypeSystem.commonSuperClass(At(ax), Bt(ax));
+		t.assertEqual(At(ax), ct.0);
+		t.assertEqual(At(ax), ct.1);
+	}
+
+	for (x in [BOOL, FLOAT]) {
+		var ax = [x];
+		var ct = TypeSystem.commonSuperClass(Ct(ax), Bt(ax));
+		t.assertEqual(At(ax), ct.0);
+		t.assertEqual(At(ax), ct.1);
+	}
+
+	for (x in [BOOL, FLOAT]) {
+		for (y in [INT_INT, ARRAY_BYTE]) {
+			var ax = [x], ay = [y];
+			var ct = TypeSystem.commonSuperClass(Bt(ax), Ct(ay));
+			t.assertEqual(At(ax), ct.0);
+			t.assertEqual(At(ay), ct.1);
+		}
+	}
+
+	for (x in [DOUBLE, VOID]) {
+		var ax = [x];
+		var ct = TypeSystem.commonSuperClass(Ct(ax), Xt);
+		t.assertEqual(null, ct.0);
+		t.assertEqual(null, ct.1);
+		var at = TypeSystem.commonSuperClass(Xt, At(ax));
+		t.assertEqual(null, at.0);
+		t.assertEqual(null, at.1);
+	}
+}
+
+def test_maybe1(t: TypeTester) {
+	var P = TypeParamType.new(0), Q = TypeParamType.new(0);
+	for (x in PRIMS) {
+		t.t.assertz(true, TypeSystem.maybeEqual(P, x));
+		t.t.assertz(true, TypeSystem.maybeEqual(x, P));
+		var ax = ArrayTypeCache.get(x), ap = ArrayTypeCache.get(P);
+		t.t.assertz(true, TypeSystem.maybeEqual(ax, ap));
+		t.t.assertz(true, TypeSystem.maybeEqual(ap, ax));
+		t.t.assertz(true, TypeSystem.maybeEqual(Q, ax));
+		t.t.assertz(true, TypeSystem.maybeEqual(ap, Q));
+	}
+}
+
+def test_cast1(t: TypeTester) {
+	for (x in PRIMS) {
+		t.assertCast(TypeCast.TRUE, x, x);
+		t.assertCast(TypeCast.TRUE, ArrayTypeCache.get(x), ArrayTypeCache.get(x));
+	}
+	t.assertCast(TypeCast.INT_PROMOTE_I, BYTE, INT);
+	t.assertCast(TypeCast.INT_PROMOTE_I, INT, LONG);
+	t.assertCast(TypeCast.INT_CAST_I, INT, BYTE);
+	t.assertCast(TypeCast.INT_CAST_I, LONG, INT);
+
+	t.assertCast(TypeCast.FLOAT_PROMOTE_I, BYTE, FLOAT);
+	t.assertCast(TypeCast.FLOAT_PROMOTE_I, BYTE, DOUBLE);
+
+	var u = [VOID, BYTE, ARRAY_INT, ARRAY_BYTE, INT_INT];
+	for (x in u) {
+		for (y in u) {
+			if (x != y) t.assertCast(TypeCast.THROW, x, y);
+		}
+	}
+
+	for (x in [ARRAY_INT, ARRAY_BYTE]) {
+		t.assertCast(TypeCast.SUBSUME, NULL, x);
+	}
+
+	var P = TypeParamType.new(0), Q = TypeParamType.new(0);
+	t.assertCast(TypeCast.UNKNOWN_CAST, P, Q);
+	t.assertCast(TypeCast.TRUE, P, P);
+	for (x in u) {
+		t.assertCast(TypeCast.UNKNOWN_CAST, P, x);
+		t.assertCast(TypeCast.UNKNOWN_CAST, x, P);
+	}
+
+	t.assertCast(TypeCast.THROW, ARRAY_INT, ARRAY_BYTE);
+
+	for (x in [P, Q]) {
+		var at = ArrayTypeCache.get(x);
+		t.assertCast(TypeCast.UNKNOWN_CAST, x, at);
+		t.assertCast(TypeCast.UNKNOWN_CAST, at, x);
+		t.assertCast(TypeCast.UNKNOWN_CAST, at, ARRAY_INT);
+		t.assertCast(TypeCast.UNKNOWN_CAST, ARRAY_INT, at);
+	}
+}
+
+def test_cast_class1(t: TypeTester) {
+	var A = VstClass.new(NP, null), At = A.getCachedType(N);
+	var B = VstClass.new(NP, At), Bt = B.getCachedType(N);
+	var C = VstClass.new(NP, At), Ct = C.getCachedType(N);
+	var D = VstClass.new(NP, null), Dt = D.getCachedType(N);
+
+	for (x in [At, Bt, Ct]) {
+		t.assertCast(TypeCast.SUBSUME, NULL, x);
+		t.assertCast(TypeCast.THROW_IF_NOT_NULL, Dt, x);
+		t.assertCast(TypeCast.THROW_IF_NOT_NULL, x, Dt);
+	}
+	t.assertCast(TypeCast.SUBSUME, Bt, At);
+	t.assertCast(TypeCast.SUBSUME, Ct, At);
+	t.assertCast(TypeCast.CLASS_CAST, At, Bt);
+	t.assertCast(TypeCast.CLASS_CAST, At, Ct);
+	t.assertCast(TypeCast.THROW_IF_NOT_NULL, Ct, Bt);
+	t.assertCast(TypeCast.THROW_IF_NOT_NULL, Bt, Ct);
+}
+
+def test_cast_class2(t: TypeTester) {
+	var P = TypeParamType.new(0), Q = TypeParamType.new(0), R = TypeParamType.new(0), S = TypeParamType.new(0);
+	var A = VstClass.new([P], null), At = A.getCachedType;
+	var B = VstClass.new([Q], At([Q])), Bt = B.getCachedType;
+	var C = VstClass.new([R], At([R])), Ct = C.getCachedType;
+	var D = VstClass.new([S], null), Dt = D.getCachedType;
+
+	var ai = [Type.!(INT)];
+	for (x in [At, Bt, Ct]) {
+		t.assertCast(TypeCast.SUBSUME, NULL, x(ai));
+		t.assertCast(TypeCast.THROW_IF_NOT_NULL, Dt(ai), x(ai));
+		t.assertCast(TypeCast.THROW_IF_NOT_NULL, x(ai), Dt(ai));
+	}
+	for (x in [[Type.!(INT)], [Type.!(VOID)]]) {
+		t.assertCast(TypeCast.SUBSUME, Bt(x), At(x));
+		t.assertCast(TypeCast.SUBSUME, Ct(x), At(x));
+		t.assertCast(TypeCast.CLASS_CAST, At(x), Bt(x));
+		t.assertCast(TypeCast.CLASS_CAST, At(x), Ct(x));
+		t.assertCast(TypeCast.THROW_IF_NOT_NULL, Ct(x), Bt(x));
+		t.assertCast(TypeCast.THROW_IF_NOT_NULL, Bt(x), Ct(x));
+	}
+	t.assertCast(TypeCast.UNKNOWN_CAST, At([P]), At([INT]));
+	t.assertCast(TypeCast.UNKNOWN_CAST, At([INT]), At([P]));
+
+	t.assertCast(TypeCast.THROW_IF_NOT_NULL, Ct([P]), Bt([INT]));
+	t.assertCast(TypeCast.THROW_IF_NOT_NULL, Bt([Q]), Ct([INT]));
+}
+
+def test_cast_tuple(t: TypeTester) {
+	var u = [VOID, BYTE, ARRAY_INT, ARRAY_BYTE, INT_INT];
+	for (x in u) {
+		for (y in u) {
+			if (x == y) continue;
+			var tx = TupleTypeCache.get([INT, x]);
+			var ty = TupleTypeCache.get([INT, y]);
+			t.assertCast(TypeCast.THROW, tx, ty);
+		}
+	}
+	for (x in PRIMS) {
+		var t1 = TupleTypeCache.get([x]), t2 = TupleTypeCache.get([x, x]), t3 = TupleTypeCache.get([x, x, x]);
+		t.assertCast(TypeCast.THROW, t1, t2);
+		t.assertCast(TypeCast.THROW, t2, t1);
+		t.assertCast(TypeCast.THROW, t1, t3);
+		t.assertCast(TypeCast.THROW, t3, t2);
+
+		for (y in PRIMS) {
+			if (x == y) continue;
+			var u = TypeSystem.newTypeCast(x, y, false);
+			var d = TypeSystem.newTypeCast(y, x, false);
+			var x_y = TupleTypeCache.get([x, y]);
+			var y_x = TupleTypeCache.get([y, x]);
+			if (u == TypeCast.THROW || d == TypeCast.THROW) t.assertCast(TypeCast.THROW, x_y, y_x);
+			else t.assertCasts([u, d], x_y, y_x);
+		}
+	}
+	// TODO: structural tuple casts
+}
+
+def test_subtype_indexed(t: TypeTester) {
+	var A = VstClass.new(NP, null), At = A.getCachedType(N);
+	var B = VstClass.new(NP, At), Bt = B.getCachedType(N);
+	var C = VstClass.new(NP, At), Ct = C.getCachedType(N);
+
+	var TYPES = Arrays.concat(PRIMS, [Type.!(At), Bt, Ct]);
+
+	var mutArrays = Arrays.map(TYPES, ArrayTypeCache.get2(true, _));
+	var immArrays = Arrays.map(TYPES, ArrayTypeCache.get2(false, _));
+	var mutRanges = Arrays.map(TYPES, RangeTypeCache.get(true, _));
+	var immRanges = Arrays.map(TYPES, RangeTypeCache.get(false, _));
+	var seqs = Arrays.map(TYPES, SeqTypeCache.get);
+
+	for (x in mutArrays) {
+		for (y in mutArrays) if (x != y) t.assertUnrelated(x, y);
+		for (y in immArrays) t.assertUnrelated(x, y);
+		for (y in seqs) t.assertUnrelated(x, y);
+	}
+	for (x in immArrays) {
+		for (y in mutArrays) t.assertUnrelated(x, y);
+		for (y in immArrays) t.assertCovariant(x, y, x.elemType, y.elemType);
+		for (y in mutRanges) t.assertUnrelated(x, y);
+		for (y in seqs) t.assertUnrelated(x, y);
+	}
+	for (x in mutRanges) {
+		for (y in mutRanges) {
+			if (x == y) t.assertEqual(x, y);
+			else t.assertUnrelated(x, y);
+		}
+		for (y in immRanges) t.assertUnrelated(x, y);
+		for (y in seqs) t.assertUnrelated(x, y);
+	}
+	for (x in immRanges) {
+		for (y in immRanges) t.assertCovariant(x, y, x.elemType, y.elemType);
+		for (y in mutRanges) t.assertUnrelated(x, y);
+	}
+	for (x in seqs) {
+		for (y in seqs) t.assertCovariant(x, y, x.elemType, y.elemType);
+	}
+}
+
+def test_promote_indexed(t: TypeTester) {
+	var A = VstClass.new(NP, null), At = A.getCachedType(N);
+	var B = VstClass.new(NP, At), Bt = B.getCachedType(N);
+	var C = VstClass.new(NP, At), Ct = C.getCachedType(N);
+
+	var TYPES = Arrays.concat(PRIMS, [Type.!(At), Bt, Ct]);
+
+	var mutArrays = Arrays.map(TYPES, ArrayTypeCache.get2(true, _));
+	var immArrays = Arrays.map(TYPES, ArrayTypeCache.get2(false, _));
+	var mutRanges = Arrays.map(TYPES, RangeTypeCache.get(true, _));
+	var immRanges = Arrays.map(TYPES, RangeTypeCache.get(false, _));
+	var seqs = Arrays.map(TYPES, SeqTypeCache.get);
+
+	for (x in mutArrays) {
+		for (y in mutRanges) {
+			if (x.elemType == y.elemType) t.assertPromotable(true, x, y);
+			else t.assertUnrelated(x, y);
+		}
+	}
+	for (x in immArrays) {
+		for (y in immRanges) {
+			if (TypeSystem.isSubtype(x.elemType, y.elemType)) t.assertPromotable(true, x, y);
+			else t.assertUnrelated(x, y);
+		}
+	}
+	for (x in immRanges) {
+		for (y in seqs) {
+			var promotable = TypeSystem.isSubtype(y.elemType, x.elemType);
+			t.assertPromotable(promotable, y, x);
+			if (!promotable) t.assertUnrelated(x, y);
+		}
+	}
+}
+
+def test_alias1(t: TypeTester) {
+	for (x in PRIMS) {
+		var A = VstAlias.new(null, x);
+		var TA = A.getCachedType(N);
+		t.assertAssignable(true, TA, x);
+		t.assertSubtype(true, TA, x);
+		t.assertAssignable(false, x, TA);
+		t.assertSubtype(false, x, TA);
+	}
+	var P = TypeParamType.new(0), Q = TypeParamType.new(0);
+	for (x in [P, Q]) {
+		var A = VstAlias.new([x], x);
+
+		var TI = A.getCachedType([INT]);
+		t.assertAssignable(true, TI, INT);
+		t.assertSubtype(true, TI, INT);
+		t.assertAssignable(false, INT, TI);
+		t.assertSubtype(false, INT, TI);
+
+		var TZ = A.getCachedType([BOOL]);
+		t.assertAssignable(false, TZ, INT);
+		t.assertSubtype(false, TZ, INT);
+	}
+}
+
+def main(args: Array<string>) -> int {
+	var list: List<GlobMatcher>;
+
+	for (a in args) {
+		if (Strings.equal("-fatal", a)) UnitTests.fatal = true;
+		else list = List.new(GlobMatcher.new(a), list);
+	}
+
+	var t = UnitTests.run(list);
+	return if (t.0 == t.1, 0, 1);
+}
