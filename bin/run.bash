@@ -2,11 +2,11 @@
 
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
-  DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+  HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
   SOURCE="$(readlink "$SOURCE")"
-  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+  [[ $SOURCE != /* ]] && SOURCE="$HERE/$SOURCE"
 done
-DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
 function usage() {
     echo "Usage: run.bash [aeneas...] <tiny|small|large|huge> [target [benchmarks]]"
@@ -14,10 +14,11 @@ function usage() {
     exit 1
 }
 
-VIRGIL_LOC=${VIRGIL_LOC:=$(cd $DIR/.. && pwd)}
 RUNS=${RUNS:=5}
 
-cd $DIR
+cd $HERE
+
+APPS=../apps/
 
 TMP=/tmp/$USER/virgil-bench
 mkdir -p $TMP
@@ -65,15 +66,18 @@ fi
 
 mkdir -p $TMP
 
-BTIME="./btime-$(../bin/sense_host | cut -d' ' -f1)"
+BTIME_BIN="btime-$(./sense_host | cut -d' ' -f1)"
 if [ $? != 0 ]; then
 	echo Could not sense host platform.
 	exit 1
 fi
 
+BTIME="../btime/$BTIME_BIN"
 if [ ! -x $BTIME ]; then
-	echo Compiling btime.c...
-	gcc -m32 -lm -O2 -o $BTIME btime.c
+    echo Compiling btime.c...
+    pushd ../btime
+    cc -m32 -lm -O2 -o $BTIME_BIN btime.c
+    popd
 fi
 
 #./compile.bash $target $benchmarks
@@ -97,27 +101,28 @@ for p in $benchmarks; do
 	fi
 done
 
-for p in $benchmarks; do
-	if [ ! -f "$p/args-$size" ]; then
+for b in $benchmarks; do
+    B=$APPS/$b
+	if [ ! -f "$B/args-$size" ]; then
 		continue
 	fi
 
 	if [ ! -z $AENEAS_BINARY ]; then
-		args=$(cat $p/args-$size)
-		echo "$p ($size): $args"
+		args=$(cat $B/args-$size)
+		echo "$b ($size): $args"
 
 		i=0
 		for aeneas in ${AENEAS_BINARY[@]}; do
-			PROG=$TMP/${marks[$i]}/$p-$target
+			PROG=$HERE/out/$b-$target
 			echo -n "$aeneas: "
 			$BTIME -i $RUNS $PROG $args
 			i=($i+1)
 		done
 	else
-		PROG=$TMP/$p-$target
-		args=$(cat $p/args-$size)
+		PROG=$TMP/$b-$target
+		args=$(cat $B/args-$size)
 		
-		echo "$p ($size): $PROG $args"
+		echo "$b ($size): $PROG $args"
 		$BTIME $RUNS $PROG $args
 	fi
 done
