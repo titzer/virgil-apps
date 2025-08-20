@@ -17,8 +17,6 @@ VIRGIL_LOC=${VIRGIL_LOC:=$(cd $HERE/.. && pwd)}
 
 cd $HERE
 
-#TODO BTIME="./btime-$(../bin/dev/sense_host | cut -d' ' -f1)"
-
 TMP=/tmp/$USER/virgil-bench/
 mkdir -p $TMP
 
@@ -50,6 +48,14 @@ function do_compile() {
     EXE=$OUT/$PROG
 
     cd $HERE/../apps/$p
+
+    if [ -f TARGETS ]; then
+	grep -q $target TARGETS > /dev/null
+	if [ $? != 0 ]; then
+	    ERROR_MSG=": unsupported target"
+	    return 1
+	fi
+    fi
     
     files="*.v3"
     if [ -f DEPS ]; then
@@ -88,6 +94,8 @@ function do_compile() {
     fi
 }
 
+ERROR_MSG=""
+
 for p in $benchmarks; do
 	if [ -z $binary ]; then
 		printf "##+compiling (%s) %s\n" $target $p
@@ -97,7 +105,7 @@ for p in $benchmarks; do
 	do_compile $p
 
 	if [ $? != 0 ]; then
-	    printf "##-fail\n"
+	    printf "##-fail%s\n" "$ERROR_MSG"
 	else
 	    printf "##-ok\n"
 	fi

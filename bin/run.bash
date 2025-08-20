@@ -65,7 +65,7 @@ fi
 
 mkdir -p $TMP
 
-BTIME="./btime-$(../bin/dev/sense_host | cut -d' ' -f1)"
+BTIME="./btime-$(../bin/sense_host | cut -d' ' -f1)"
 if [ $? != 0 ]; then
 	echo Could not sense host platform.
 	exit 1
