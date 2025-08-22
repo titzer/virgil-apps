@@ -1,0 +1,98 @@
+def new2<T>(m: int, n: int) -> Array<Array<T>> {
+	var result = Array<Array<T>>.new(m);
+	for (i < m) result[i] = Array<T>.new(n);
+	return result;
+}
+
+def dotProduct(a: Array<double>, b: Array<double>) -> double {
+	var sum = 0d;
+	for (i < a.length) sum += a[i] * b[i];
+	return sum;
+}
+
+def matrixMul(A: Array<Array<double>>, B: Array<Array<double>>) -> Array<Array<double>> {
+	var result = new2<double>(A.length, B[0].length);
+	var aux = Array<double>.new(B.length);
+
+	for (j < B[0].length) {
+		for (k < B.length) aux[k] = B[k][j];
+
+		for (i < A.length) result[i][j] = dotProduct(A[i], aux);
+	}
+	return result;
+}
+
+def pivotize(m: Array<Array<double>>) -> Array<Array<double>> {
+	var n = m.length;
+	var id = new2<double>(n, n);
+	for (i < n) id[i][i] = 1;
+
+	for (i < n) {
+		var maxm = m[i][i];
+		var row = i;
+		for (j = i; j < n; j++)
+			if (m[j][i] > maxm) {
+				maxm = m[j][i];
+				row = j;
+			}
+
+		if (i != row) {
+			var tmp = id[i];
+			id[i] = id[row];
+			id[row] = tmp;
+		}
+	}
+	return id;
+}
+
+def lu(A: Array<Array<double>>) -> Array<Array<Array<double>>> {
+	var n = A.length;
+	var L = new2<double>(n, n);
+	var U = new2<double>(n, n);
+	var P = pivotize(A);
+	var A2 = matrixMul(P, A);
+
+	for (j < n) {
+		L[j][j] = 1;
+		for (i < j + 1) {
+			var s1 = 0d;
+			for (k < i) s1 += U[k][j] * L[i][k];
+			U[i][j] = A2[i][j] - s1;
+		}
+		for (i = j; i < n; i++) {
+			var s2 = 0d;
+			for (k < j) s2 += U[k][j] * L[i][k];
+			L[i][j] = (A2[i][j] - s2) / U[j][j];
+		}
+	}
+	return [L, U, P];
+}
+
+def print(m: Array<Array<double>>) {
+//	stream(m).forEach(a -> {
+//		stream(a).forEach(n -> System.out.printf(Locale.US, "%5.1f ", n));
+//		System.ln();
+//	});
+	System.ln();
+}
+
+def main(args: Array<string>) {
+	var a = [
+		[1.0, 3, 5],
+		[2.0, 4, 7],
+		[1.0, 1, 0]
+	];
+
+	var b = [
+		[11.0, 9, 24, 2],
+		[1.0, 5, 2, 6],
+		[3.0, 17, 18, 1],
+		[2.0, 5, 7, 1]
+	];
+
+	for (m in lu(a)) print(m);
+
+	System.ln();
+
+	for (m in lu(b)) print(m);
+}
