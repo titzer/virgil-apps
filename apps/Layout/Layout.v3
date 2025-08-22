@@ -1,0 +1,80 @@
+def JUSTIFY = 25;
+def ITERATIONS = 1000;
+def HEAP_SIZE = 100 * 1024;
+
+def main(args: Array<string>) -> int {
+	var max = ITERATIONS;
+	if (args.length > 0) max = Int.parse(args[0]);
+	time("alloc IntList", max, testListAlloc, 10);
+	time("sum IntList", max, testListSum, testListAlloc(10));
+	time("alloc IntLink", max, testLayoutAlloc, 10);
+	time("sum IntLink", max, testLayoutSum, testLayoutAlloc(10));
+	// TODO: scale by the number of fields
+	// TODO: heavier tests, rows, matrices
+	return 0;
+}
+
+def time<P, R>(op: string, count: int, f: P -> R, p: P) -> R {
+	System.puts(op);
+	for (i < (JUSTIFY - op.length)) System.putc(' ');
+	System.puts(": ");
+	var before = System.ticksUs();
+	var r: R;
+	for (i < count) r = f(p);
+	var after = System.ticksUs();
+	System.puti(after - before);
+	System.puts(" \xCE\xBCs\n");
+	return r; // return last result
+}
+
+// Object operations
+def testListAlloc(len: int) -> IntList {
+	var l: IntList;
+	for (i < len) l = IntList.new(i, l);
+	return l;
+}
+
+def testListSum(l: IntList) -> int {
+	var sum = 0;
+	while (l != null) { sum += l.val; l = l.tail; }
+	return sum;
+}
+
+class IntList(val: int, tail: IntList) { }
+
+// Layout operations
+def heap = Array<byte>.new(HEAP_SIZE);
+var alloc_mark = 0;
+def testLayoutAlloc(len: int) -> Ref<IntLink> {
+	alloc_mark = 0;
+	var p: Ref<IntLink>;
+	var none: Ref<IntLink>;
+	for (i < len) {
+		var n = Ref<IntLink>.at(heap, alloc_mark);
+		n.val = i;
+		if (p != none) {
+			n.tail = int.!(Pointer.atRef(p) - Pointer.atContents(heap));
+		}
+		alloc_mark += IntLink.size;
+		p = n;
+	}
+	return p;
+}
+
+def testLayoutSum(r: Ref<IntLink>) -> int {
+	var none: Ref<IntLink>;
+	var sum = 0;
+	while (r != none) {
+		sum += r.val;
+		var n = r.tail;
+		if (n == 0) break;
+		r = Ref<IntLink>.at(heap, n);
+	}
+	return sum;
+}
+
+layout IntLink {
+	+0	val:	i32;
+	+4	tail:	i32;
+	=8;
+}
