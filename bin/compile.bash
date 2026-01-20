@@ -21,21 +21,21 @@ TMP=/tmp/$USER/virgil-bench/
 mkdir -p $TMP
 
 if [ -x $1 ]; then
-	binary=$1
-	shift
-	TMP=$TMP/$1
-	mkdir -p $TMP
-	shift
+    binary=$1
+    shift
+    TMP=$TMP/$1
+    mkdir -p $TMP
+    shift
 fi
 
 target="$1"
 shift
 
 if [ $# = 0 ]; then
-	benchmarks=$(./list-benchmarks.bash)
+    benchmarks=$(./list-benchmarks.bash)
 else
-	benchmarks="$*"
-	shift
+    benchmarks="$*"
+    shift
 fi
 
 function do_compile() {
@@ -52,11 +52,11 @@ function do_compile() {
     if [ -f TARGETS ]; then
 	grep -q $target TARGETS > /dev/null
 	if [ $? != 0 ]; then
-	    ERROR_MSG=": unsupported target"
-	    return 1
+	    ERROR_MSG=": skipping unsupported target"
+	    return 0
 	fi
     fi
-    
+
     files="*.v3"
     if [ -f DEPS ]; then
 	files="$files $(cat DEPS)"
@@ -68,13 +68,13 @@ function do_compile() {
 	opts="$opts $(cat $p/v3c-opts-$target)"
     fi
 
-		if [ ! -z $binary ]; then
-			# compile with provided binary
-			RT=$VIRGIL_LOC/rt
-			RT_FILES=$(echo $RT/$target/*.v3 $RT/native/*.v3 $RT/gc/*.v3)
-			CONFIG="-heap-size=200m -stack-size=2m -target=$target -rt.sttables -rt.gc -rt.gctables -rt.files="
-			$BTIME -i 1 $binary $CONFIG"$RT_FILES" -output=$OUT -program-name=$PROG "${opts[@]}" $files
-			return $?
+    if [ ! -z $binary ]; then
+	# compile with provided binary
+	RT=$VIRGIL_LOC/rt
+	RT_FILES=$(echo $RT/$target/*.v3 $RT/native/*.v3 $RT/gc/*.v3)
+	CONFIG="-heap-size=200m -stack-size=2m -target=$target -rt.sttables -rt.gc -rt.gctables -rt.files="
+	$BTIME -i 1 $binary $CONFIG"$RT_FILES" -output=$OUT -program-name=$PROG "${opts[@]}" $files
+	return $?
     elif [ "$target" = "v3i" ]; then
 	# v3i is a special target that runs the V3C interpreter
 	echo "#!/bin/bash" > $EXE
@@ -97,16 +97,16 @@ function do_compile() {
 ERROR_MSG=""
 
 for p in $benchmarks; do
-	if [ -z $binary ]; then
-		printf "##+compiling (%s) %s\n" $target $p
-	else
-		printf "##+compiling %s (%s) %s\n" $binary $target $p
-	fi
-	do_compile $p
+    if [ -z $binary ]; then
+	printf "##+compiling (%s) %s\n" $target $p
+    else
+	printf "##+compiling %s (%s) %s\n" $binary $target $p
+    fi
+    do_compile $p
 
-	if [ $? != 0 ]; then
-	    printf "##-fail%s\n" "$ERROR_MSG"
-	else
-	    printf "##-ok\n"
-	fi
+    if [ $? != 0 ]; then
+	printf "##-fail%s\n" "$ERROR_MSG"
+    else
+	printf "##-ok%s\n" "$ERROR_MSG"
+    fi
 done

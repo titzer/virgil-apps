@@ -1,0 +1,5 @@
+wasm
+x86-linux
+x86-64-linux
+x86-darwin
+x86-64-darwin
