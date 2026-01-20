@@ -1,7 +1,7 @@
 #!/bin/bash
 
 if [ $# = 0 ]; then
-	echo "Usage: compile.bash <target> [benchmarks]"
+	echo "Usage: compile.bash <target> [apps]"
 	exit 1
 fi
 
@@ -15,67 +15,69 @@ HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
 VIRGIL_LOC=${VIRGIL_LOC:=$(cd $HERE/.. && pwd)}
 
+echo "V3C=\"$V3C\""
+echo "V3C_OPTS=\"$V3C_OPTS\""
+echo "VIRGIL_LOC=\"$VIRGIL_LOC\""
+
 cd $HERE
 
 TMP=/tmp/$USER/virgil-bench/
 mkdir -p $TMP
 
-if [ -x $1 ]; then
-    binary=$1
-    shift
-    TMP=$TMP/$1
-    mkdir -p $TMP
-    shift
-fi
-
 target="$1"
 shift
 
+OUT=${OUT:=$HERE/../out/$target/}
+mkdir -p $OUT
+OUT=$(cd $OUT && pwd)
+
+echo "OUT=\"$OUT\""
+
 if [ $# = 0 ]; then
-    benchmarks=$(./list-benchmarks.bash)
+    apps=$(./list-apps.bash)
 else
-    benchmarks="$*"
+    apps="$*"
     shift
 fi
 
 function do_compile() {
     p=$1
     opts="${V3C_OPTS[@]}"
-    OUT=$HERE/../out/$target/
-    mkdir -p $OUT
-    OUT=$(cd $OUT && pwd)
     PROG=$p.$target
     EXE=$OUT/$PROG
+    ERROR_MSG=""
 
     cd $HERE/../apps/$p
 
     if [ -f TARGETS ]; then
 	grep -q $target TARGETS > /dev/null
 	if [ $? != 0 ]; then
-	    ERROR_MSG=": skipping unsupported target"
+	    ERROR_MSG=": skipping unsupported target: $target"
 	    return 0
 	fi
     fi
 
+    # Add files from DEPS and DEPS-target
     files="*.v3"
-    if [ -f DEPS ]; then
+    if [ -f "DEPS" ]; then
 	files="$files $(cat DEPS)"
     fi
-    if [ -f "$p/v3c-opts" ]; then
-	opts="$opts $(cat $p/v3c-opts)"
+    if [ -f "DEPS-$target" ]; then
+	files="$files $(cat DEPS-$target)"
     fi
-    if [ -f "$p/v3c-opts-$target" ]; then
-	opts="$opts $(cat $p/v3c-opts-$target)"
+    # Add options from V3C_OPTS and V3C_OPTS-target
+    if [ -f "V3C_OPTS" ]; then
+	opts="$opts $(cat V3C_OPTS)"
+    fi
+    if [ -f "V3C_OPTS-$target" ]; then
+	opts="$opts $(cat V3C_OPTS-$target)"
     fi
 
-    if [ ! -z $binary ]; then
-	# compile with provided binary
-	RT=$VIRGIL_LOC/rt
-	RT_FILES=$(echo $RT/$target/*.v3 $RT/native/*.v3 $RT/gc/*.v3)
-	CONFIG="-heap-size=200m -stack-size=2m -target=$target -rt.sttables -rt.gc -rt.gctables -rt.files="
-	$BTIME -i 1 $binary $CONFIG"$RT_FILES" -output=$OUT -program-name=$PROG "${opts[@]}" $files
-	return $?
-    elif [ "$target" = "v3i" ]; then
+    if [ ! -z "$opts" ]; then
+	echo "  $opts"
+    fi
+    
+    if [ "$target" = "v3i" ]; then
 	# v3i is a special target that runs the V3C interpreter
 	echo "#!/bin/bash" > $EXE
 	echo "exec v3i $files \"$@\"" >> $EXE
@@ -89,20 +91,22 @@ function do_compile() {
 	return 0
     else
 	# compile to the given target architecture
-	v3c-$target -output=$OUT $opts -program-name=$PROG $files
+	v3c-$target -output=$OUT -program-name=$PROG $opts $files
 	return $?
     fi
 }
 
 ERROR_MSG=""
 
-for p in $benchmarks; do
-    if [ -z $binary ]; then
-	printf "##+compiling (%s) %s\n" $target $p
+for x in $apps; do
+    app=${x#apps/} # remove app/ prefix
+    app=${app%%/}    # remove / suffixes
+    if [ -z "$V3C" ]; then
+	printf "##+compiling -target=%s %s\n" $target $app
     else
-	printf "##+compiling %s (%s) %s\n" $binary $target $p
+	printf "##+compiling V3C=%s -target=%s %s\n" "$V3C" $target $app
     fi
-    do_compile $p
+    do_compile $app
 
     if [ $? != 0 ]; then
 	printf "##-fail%s\n" "$ERROR_MSG"
