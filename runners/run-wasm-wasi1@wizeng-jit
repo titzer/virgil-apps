@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
-WIZENG=${BASH_SOURCE[0]}../config/wizeng
+CONFIG=${BASH_SOURCE[0]}../config
+WIZENG_OPTS=--mode=jit
 
 WASM=$1
 shift

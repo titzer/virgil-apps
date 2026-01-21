@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
-WIZENG=${BASH_SOURCE[0]}../config/wizeng
+CONFIG=${BASH_SOURCE[0]}../config
 
 WASM=$1
 shift
 
-exec $WIZENG $WIZENG_OPTS $WASM "$@"
+exec $CONFIG/wizeng $WASM "$@"
