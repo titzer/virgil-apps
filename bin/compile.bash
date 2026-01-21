@@ -7,17 +7,17 @@ fi
 
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
-  HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+  HERE=$(builtin cd -P $(dirname "$SOURCE") >/dev/null 2>&1 && builtin pwd)
   SOURCE="$(readlink "$SOURCE")"
   [[ $SOURCE != /* ]] && SOURCE="$HERE/$SOURCE"
 done
-HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+HERE=$(builtin cd -P $(dirname "$SOURCE") >/dev/null 2>&1 && builtin pwd)
 
 VIRGIL_LOC=${VIRGIL_LOC:=$(cd $HERE/.. && pwd)}
 
 if [ -z "$V3C" ]; then
     if [ -x "$HERE/../config/v3c" ]; then
-	V3C="$(cd $HERE/../config && pwd)/v3c"
+	V3C=$(builtin cd $HERE/../config && pwd)/v3c
     else
 	V3C=$(which v3c)
     fi
@@ -37,7 +37,7 @@ shift
 
 OUT=${OUT:=$HERE/../out/$target/}
 mkdir -p $OUT
-OUT=$(cd $OUT && pwd)
+OUT=$(builtin cd $OUT && pwd)
 
 echo "OUT=\"$OUT\""
 
