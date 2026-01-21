@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-CONFIG=${BASH_SOURCE[0]}../config
+CONFIG=$(dirname ${BASH_SOURCE[0]})/../config
 WIZENG_OPTS=--mode=jit
 
 WASM=$1

@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 
-CONFIG=${BASH_SOURCE[0]}../config
+CONFIG=$(dirname ${BASH_SOURCE[0]})/../config
 
 OUT=$1
 shift
 TEST=$1
 shift
 
-BASE=${TEST/%.v3/}
-exec $CONFIG/java -jar $OUT/${BASE}.jar $@
+exec $CONFIG/java -jar $OUT/${TEST}.jar $@

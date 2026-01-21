@@ -1,6 +1,6 @@
 #!/bin/bash
 
-CONFIG=${BASH_SOURCE[0]}../config
+CONFIG=$(dirname ${BASH_SOURCE[0]})/../config
 
 OUT=$1
 shift
