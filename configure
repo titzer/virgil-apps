@@ -10,6 +10,7 @@ DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
 CONFIG=$DIR/config
 BIN=$DIR/bin
+RUNNERS=$DIR/runners
 
 mkdir -p $CONFIG
 
@@ -101,7 +102,7 @@ for host in $HOSTS; do
 	if [[ ! -L "$CONFIG/test-$n" && "$host" = "$n" ]]; then
 	    echo target=$host
 	    green native "run-$host"
-	    ln -s $BIN/run-native-sh $CONFIG/run-$host
+	    ln -s $RUNNERS/run-native-sh $CONFIG/run-$host
 	fi
     done
 done
@@ -134,7 +135,7 @@ D8=${D8:=$(which d8)}
 T="jar"
 echo target=$T
 if [[ -L "$CONFIG/java" ]]; then
-    try_link $BIN/run-jar run-jar
+    try_link $RUNNERS/run-jar run-jar
 else
     print_skipped
 fi
@@ -145,10 +146,10 @@ T="wasm-wave"
 echo target=$T
 
 if [[ -L $CONFIG/wizeng ]]; then
-    try_link $BIN/run-$T@wizeng run-$T@wizeng
+    try_link $RUNNERS/run-$T@wizeng run-$T@wizeng
 fi
 if [[ -L $CONFIG/node ]]; then
-    try_link $BIN/run-$T@node run-$T@node
+    try_link $RUNNERS/run-$T@node run-$T@node
 fi
 
 #############################################################################
@@ -157,16 +158,16 @@ T="wasm-wasi1"
 echo target=$T
 
 if [[ -L $CONFIG/wasmtime ]]; then
-    try_link $BIN/run-$T@wasmtime run-$T@wasmtime
+    try_link $RUNNERS/run-$T@wasmtime run-$T@wasmtime
 fi
 if [[ -L $CONFIG/node ]]; then
-    try_link $BIN/run-$T@node run-$T@node
+    try_link $RUNNERS/run-$T@node run-$T@node
 fi
 if [[ -L $CONFIG/wasm3 ]]; then
-    try_link $BIN/run-$T@wasm3 run-$T@wasm3
+    try_link $RUNNERS/run-$T@wasm3 run-$T@wasm3
 fi
 if [[ -L $CONFIG/wizeng ]]; then
-    try_link $BIN/run-$T@wizeng run-$T@wizeng
+    try_link $RUNNERS/run-$T@wizeng run-$T@wizeng
 fi
 
 #############################################################################
@@ -175,11 +176,11 @@ T="wasm-linux"
 echo target=$T
 
 if [[ -L $CONFIG/iwasm || -x $CONFIG/iwasm ]]; then
-    try_link $BIN/run-$T@iwasm run-$T@iwasm
+    try_link $RUNNERS/run-$T@iwasm run-$T@iwasm
 fi
 
 for host in $HOSTS; do
     if [ "$host" = "x86-64-linux" ]; then
-	try_link $BIN/run-$T@wizeng run-$T@wizeng
+	try_link $RUNNERS/run-$T@wizeng run-$T@wizeng
     fi
 done
