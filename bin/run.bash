@@ -14,7 +14,11 @@ APPS=$ROOT/apps
 OUT_ROOT=$ROOT/out
 
 function usage() {
-    echo "Usage: run.bash <tiny|small|large|huge> [apps...]"
+    echo "Usage: run.bash <test|tiny|small|large|huge> [apps...]"
+    echo ""
+    echo "Sizes:"
+    echo "  test   - run with args-test and compare output to output-test"
+    echo "  tiny, small, large, huge - benchmark with btime"
     echo ""
     echo "Environment variables:"
     echo "  CONFIGS  - space-separated list of targets or target@runtime configurations"
@@ -22,9 +26,9 @@ function usage() {
     echo "  RUNS     - number of runs for benchmarking (default: 5)"
     echo ""
     echo "Examples:"
-    echo "  CONFIGS='wasm-wasi1' run.bash small          # compare all wasm-wasi1 runtimes"
+    echo "  CONFIGS='wasm-wasi1' run.bash test           # test all wasm-wasi1 runtimes"
+    echo "  CONFIGS='wasm-wasi1' run.bash small          # benchmark all wasm-wasi1 runtimes"
     echo "  CONFIGS='wasm-wasi1@node' run.bash small     # run only with node"
-    echo "  CONFIGS='wasm-wasi1 jar' run.bash small      # compare wasm and jar targets"
     echo ""
     echo "Compilation configurations are detected from out/ directories."
     echo "E.g., out/wasm-wasi1/ and out/wasm-wasi1@o2/ are both used."
@@ -45,10 +49,10 @@ size=$1
 shift
 
 case $size in
-    tiny|small|large|huge)
+    test|tiny|small|large|huge)
         ;;
     *)
-        echo "Error: invalid size '$size'. Must be one of: tiny, small, large, huge"
+        echo "Error: invalid size '$size'. Must be one of: test, tiny, small, large, huge"
         usage
         ;;
 esac
@@ -102,20 +106,25 @@ for config in $CONFIGS; do
 done
 CONFIGS=$expanded_configs
 
-# Set up btime for benchmarking
-BTIME_BIN="btime-$("$HERE/sense_host" | cut -d' ' -f1)"
-if [ $? != 0 ]; then
-    echo "Error: could not sense host platform."
-    exit 1
+# Set up btime for benchmarking (not needed for test mode)
+if [ "$size" != "test" ]; then
+    BTIME_BIN="btime-$("$HERE/sense_host" | cut -d' ' -f1)"
+    if [ $? != 0 ]; then
+        echo "Error: could not sense host platform."
+        exit 1
+    fi
+
+    BTIME="$ROOT/btime/$BTIME_BIN"
+    if [ ! -x "$BTIME" ]; then
+        echo "Compiling btime.c..."
+        pushd "$ROOT/btime" > /dev/null
+        cc -m32 -lm -O2 -o "$BTIME_BIN" btime.c
+        popd > /dev/null
+    fi
 fi
 
-BTIME="$ROOT/btime/$BTIME_BIN"
-if [ ! -x "$BTIME" ]; then
-    echo "Compiling btime.c..."
-    pushd "$ROOT/btime" > /dev/null
-    cc -m32 -lm -O2 -o "$BTIME_BIN" btime.c
-    popd > /dev/null
-fi
+TMP=/tmp/$USER/virgil-run
+mkdir -p $TMP
 
 # Find all compilation configurations for a given base target
 # Returns space-separated list of full target names (e.g., "wasm-wasi1 wasm-wasi1@o2")
@@ -132,7 +141,7 @@ function find_compile_configs() {
     echo $configs
 }
 
-# Run benchmarks for each app and configuration
+# Run tests or benchmarks for each app and configuration
 for app in $apps; do
     app=${app#apps/}   # remove apps/ prefix
     app=${app%%/}      # remove / suffixes
@@ -185,8 +194,27 @@ for app in $apps; do
                 display_name="$compile_config"
             fi
 
-            printf "  %-30s " "$display_name:"
-            $BTIME -i $RUNS "$runner" "$OUT" "$binary" $args
+            if [ "$size" = "test" ]; then
+                # Test mode: run once and compare output
+                expected="$APPDIR/output-test"
+                if [ ! -f "$expected" ]; then
+                    printf "  %-30s (skip: no output-test)\n" "$display_name:"
+                    continue
+                fi
+
+                actual="$TMP/$app.$compile_config.out"
+                "$runner" "$OUT" "$binary" $args > "$actual" 2>&1
+
+                if diff -q "$expected" "$actual" > /dev/null 2>&1; then
+                    printf "  %-30s ok\n" "$display_name:"
+                else
+                    printf "  %-30s FAIL\n" "$display_name:"
+                fi
+            else
+                # Benchmark mode
+                printf "  %-30s " "$display_name:"
+                $BTIME -i $RUNS "$runner" "$OUT" "$binary" $args
+            fi
         done
     done
 done
