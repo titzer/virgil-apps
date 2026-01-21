@@ -110,10 +110,6 @@ function do_compile() {
 	opts="$opts $(cat V3C_OPTS-$base_target)"
     fi
 
-    if [ ! -z "$opts" ]; then
-	echo "  $opts"
-    fi
-
     if [ "$base_target" = "v3i" ]; then
 	# v3i is a special target that runs the V3C interpreter
 	echo "#!/bin/bash" > $EXE

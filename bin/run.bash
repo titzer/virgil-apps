@@ -154,8 +154,9 @@ for app in $apps; do
     fi
 
     args=$(cat "$APPDIR/args-$size")
-    echo ""
-    echo "=== $app ($size): $args ==="
+    if [ "$size" != "test" ]; then
+       echo "=== $app ($size): $args ==="
+    fi
 
     for config in $CONFIGS; do
         # Extract base target from runtime config (e.g., "wasm-wasi1@node" -> "wasm-wasi1")
@@ -178,6 +179,9 @@ for app in $apps; do
         fi
 
         for compile_config in $compile_configs; do
+	    if [ "$size" = "test" ]; then
+		echo "##+$app $compile_config"
+	    fi
             OUT="$OUT_ROOT/$compile_config"
             binary="$app.$compile_config"
 
@@ -198,7 +202,7 @@ for app in $apps; do
                 # Test mode: run once and compare output
                 expected="$APPDIR/output-test"
                 if [ ! -f "$expected" ]; then
-                    printf "  %-30s (skip: no output-test)\n" "$display_name:"
+		    echo "##-ok: skipped, no output-test"
                     continue
                 fi
 
@@ -206,9 +210,9 @@ for app in $apps; do
                 "$runner" "$OUT" "$binary" $args > "$actual" 2>&1
 
                 if diff -q "$expected" "$actual" > /dev/null 2>&1; then
-                    printf "  %-30s ok\n" "$display_name:"
+		    echo "##-ok"
                 else
-                    printf "  %-30s FAIL\n" "$display_name:"
+		    echo "##-fail: see $actual"
                 fi
             else
                 # Benchmark mode
