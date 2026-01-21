@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+
+CONFIG=$DIR/config
+BIN=$DIR/bin
+
+mkdir -p $CONFIG
+
+GREEN='[0;32m'
+YELLOW='[0;33m'
+RED='[0;31m'
+NORM='[0;00m'
+
+if [ "$1" = "clean" ]; then
+    rm -f $CONFIG/*
+    exit 0
+fi
+
+NATIVE_HOSTS="x86-linux x86-64-linux x86-darwin x86-64-darwin arm64-linux arm64-darwin"
+
+VIRGIL_LOC=${VIRGIL_LOC:=$(cd $(dirname ${BASH_SOURCE[0]}) && cd .. && pwd)}
+
+function green() {
+    printf "\t%-8s ${GREEN}%s${NORM} %s\n" "($1)" "$2" "$3"
+}
+
+function print_skipped() {
+    printf "\t${YELLOW}(skipped)${NORM}\n"
+}
+
+function link() {
+    from=$1
+    to=$2
+
+    green linked "config/$2 -> $1"
+    ln -s $1 $CONFIG/$2
+}
+
+function try_link() {
+    from=$1
+    to=$2
+
+    if [[ ! -L $CONFIG/$2 ]]; then
+	green linked "config/$2 -> $1"
+	ln -s $1 $CONFIG/$2
+    fi
+}
+
+function link_cmd() {
+    # check to see if the command was manually specified in environment
+    if [ ! -z "$2" ]; then
+	echo $1
+	rm -f $CONFIG/$1
+	link $2 $1
+	return 0
+    fi
+    # is it already configured?
+    if [[ -L $CONFIG/$1 ]]; then
+	return 0
+    fi
+    echo $1
+    # search path
+    CMD=$(which $1)
+    if [ ! -z "$CMD" ]; then
+	link $CMD $1
+	return 0
+    else
+	print_skipped
+	return 1
+    fi
+}
+
+######################################################
+# begin configuration
+######################################################
+
+touch $CONFIG/configged
+
+#############################################################################
+## target=<native>
+HOSTS=$($BIN/sense_host)
+printf "hosts=${GREEN}$HOSTS${NORM}\n"
+
+for host in $HOSTS; do
+    # configure progress if not already
+    if [[ ! -L "$CONFIG/progress" && -x "$BIN/progress-$host" ]]; then
+	echo progress
+	printf "\t(native) ${GREEN}%s${NORM}\n" "progress-$host"
+	ln -s $BIN/progress-$host $CONFIG/progress
+    fi
+
+    # link native platform executors
+    for n in $NATIVE_HOSTS; do
+	if [[ ! -L "$CONFIG/test-$n" && "$host" = "$n" ]]; then
+	    echo target=$host
+	    green native "run-$host"
+	    ln -s $BIN/run-native-sh $CONFIG/run-$host
+	fi
+    done
+done
+
+for n in $NATIVE_HOSTS; do
+    if [[ ! -L "$CONFIG/test-$n" ]]; then
+	# simply report native targets not part of host as skipped
+	# TODO: search for emulator targets
+	echo target=$n
+	print_skipped
+    fi
+done
+
+#############################################################################
+
+V3C=${V3C:=$(which v3c)}
+
+link_cmd v3c "$V3C"
+link_cmd java "$JAVA"
+link_cmd node "$NODE"
+link_cmd wasmtime "$WASMTIME"
+link_cmd wasm3 "$WASM3"
+link_cmd wizeng "$WIZENG"
+link_cmd iwasm "$IWASM"
+D8=${D8:=$(which d8)}
+
+
+#############################################################################
+## target=jar
+T="jar"
+echo target=$T
+if [[ -L "$CONFIG/java" ]]; then
+    try_link $BIN/run-jar run-jar
+else
+    print_skipped
+fi
+
+#############################################################################
+## target=wasm-wave
+T="wasm-wave"
+echo target=$T
+
+if [[ -L $CONFIG/wizeng ]]; then
+    try_link $BIN/run-$T@wizeng run-$T@wizeng
+fi
+if [[ -L $CONFIG/node ]]; then
+    try_link $BIN/run-$T@node run-$T@node
+fi
+
+#############################################################################
+## target=wasm-wasi1
+T="wasm-wasi1"
+echo target=$T
+
+if [[ -L $CONFIG/wasmtime ]]; then
+    try_link $BIN/run-$T@wasmtime run-$T@wasmtime
+fi
+if [[ -L $CONFIG/node ]]; then
+    try_link $BIN/run-$T@node run-$T@node
+fi
+if [[ -L $CONFIG/wasm3 ]]; then
+    try_link $BIN/run-$T@wasm3 run-$T@wasm3
+fi
+if [[ -L $CONFIG/wizeng ]]; then
+    try_link $BIN/run-$T@wizeng run-$T@wizeng
+fi
+
+#############################################################################
+## target=wasm-linux
+T="wasm-linux"
+echo target=$T
+
+if [[ -L $CONFIG/iwasm || -x $CONFIG/iwasm ]]; then
+    try_link $BIN/run-$T@iwasm run-$T@iwasm
+fi
+
+for host in $HOSTS; do
+    if [ "$host" = "x86-64-linux" ]; then
+	try_link $BIN/run-$T@wizeng run-$T@wizeng
+    fi
+done

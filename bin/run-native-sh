@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+OUT=$1
+shift
+TEST=$1
+shift
+
+BASE=$(basename $TEST .v3)
+exec $OUT/$BASE $@

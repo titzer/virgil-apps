@@ -15,6 +15,14 @@ HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
 VIRGIL_LOC=${VIRGIL_LOC:=$(cd $HERE/.. && pwd)}
 
+if [ -z "$V3C" ]; then
+    if [ -x "$HERE/../config/v3c" ]; then
+	V3C="$(cd $HERE/../config && pwd)/v3c"
+    else
+	V3C=$(which v3c)
+    fi
+fi
+
 echo "V3C=\"$V3C\""
 echo "V3C_OPTS=\"$V3C_OPTS\""
 echo "VIRGIL_LOC=\"$VIRGIL_LOC\""
