@@ -1,1 +1,1 @@
--heap-size=2000m
+-heap-size=2000m -stack-size=64m
