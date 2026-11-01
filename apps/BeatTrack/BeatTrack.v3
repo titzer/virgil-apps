@@ -1,0 +1,491 @@
+// Copyright 2026 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Beat tracking benchmark: a port of beatmapper's beat_spectral_flux.cpp.
+//   1. Spectral flux onset detection function (ODF) via STFT, plus a low-band ODF
+//   2. Raw onsets (adaptive threshold peak picking)
+//   3. Autocorrelation tempo estimation with harmonic scoring and a tempo prior
+//   4. Ellis dynamic-programming beat tracker
+//   5. Downbeat-phase check on the low-band ODF, then a pre-onset shift
+// Input is a checked-in synthetic clip (inputs/BeatTrack-100bpm.wav, made by
+// bin/gen-songs.bash from dsp/Synth.v3) at a known tempo, tiled to the requested length.
+// (The seed-beat paths of the original are omitted: no seeds are given.)
+
+def BF_FFT = 2048;
+def BF_HOP = 512;
+def BF_BINS = BF_FFT / 2;
+def MAX_BEAT_CANDS = 2048;
+
+// Algorithm parameters (beat_algo.h defaults).
+def MIN_BPM = 60.0f;
+def MAX_BPM = 200.0f;
+def ONSET_THRESHOLD = 1.5f;
+def DP_TIGHTNESS = 50.0f;
+def PRE_ONSET_MS = 30.0f;
+
+// Iterative Cooley-Tukey radix-2 in-place FFT (decimation-in-time) with
+// per-stage twiddle recurrence: a port of beatmapper's chroma_fft.h.
+def chromaFft(re: Array<float>, im: Array<float>, n: int) {
+	// Bit-reversal permutation
+	var j = 0;
+	for (i = 1; i < n; i++) {
+		var bit = n >> 1;
+		while ((j & bit) != 0) { j ^= bit; bit >>= 1; }
+		j ^= bit;
+		if (i < j) {
+			var t = re[i]; re[i] = re[j]; re[j] = t;
+			t = im[i]; im[i] = im[j]; im[j] = t;
+		}
+	}
+	// Butterfly stages
+	for (len = 2; len <= n; len <<= 1) {
+		var ang = -2.0f * 3.14159265358979f / float.roundi(len);
+		var wr = DspMath.cosf(ang), wi = DspMath.sinf(ang);
+		var half = len >> 1;
+		for (i = 0; i < n; i += len) {
+			var cr = 1.0f, ci = 0.0f;
+			for (k < half) {
+				var a = i + k, b = a + half;
+				var ur = re[a], ui = im[a];
+				var vr = re[b] * cr - im[b] * ci;
+				var vi = re[b] * ci + im[b] * cr;
+				re[a] = ur + vr; im[a] = ui + vi;
+				re[b] = ur - vr; im[b] = ui - vi;
+				var nr = cr * wr - ci * wi;
+				var ni = cr * wi + ci * wr;
+				cr = nr; ci = ni;
+			}
+		}
+	}
+}
+
+def log2f(x: float) -> float { return float.roundd(DspMath.log2(x)); }
+
+// Step 1: spectral flux ODF for audio in [tStart, tEnd]; also produces the low-band ODF.
+class FluxResult(flux: Array<float>, low: Array<float>) { }
+
+def computeFlux(pcm: Array<float>, totalFrames: int, channels: int, sampleRate: int,
+		tStart: double, tEnd: double) -> FluxResult {
+	if (pcm == null || totalFrames == 0 || sampleRate == 0 || channels == 0) return null;
+	var s0 = long.truncd(tStart * sampleRate);
+	var s1 = long.truncd(tEnd * sampleRate);
+	if (s1 > totalFrames) s1 = totalFrames;
+	if (s0 >= s1 || s1 - s0 < BF_FFT) return null;
+
+	var n = int.!((s1 - s0 - BF_FFT) / BF_HOP) + 1;
+	if (n <= 0) return null;
+
+	var flux = Array<float>.new(n);
+	var lowf = Array<float>.new(n);
+	var re = Array<float>.new(BF_FFT);
+	var im = Array<float>.new(BF_FFT);
+	var prev = Array<float>.new(BF_BINS);
+	// "Low" = bins below ~260 Hz: kick and bass.
+	var lowBins = int.truncd(260.0 * BF_FFT / sampleRate) + 1;
+	if (lowBins > BF_BINS) lowBins = BF_BINS;
+
+	// Hann window
+	var window = Array<float>.new(BF_FFT);
+	for (i < BF_FFT) {
+		window[i] = 0.5f * (1.0f - DspMath.cosf(2.0f * 3.14159265f * float.roundi(i) / float.roundi(BF_FFT - 1)));
+	}
+	var fch = float.roundi(channels);
+
+	for (f < n) {
+		var off = s0 + long.!(f) * BF_HOP;
+		// Mix to mono
+		for (i < BF_FFT) {
+			var fi = off + i;
+			var s = 0.0f;
+			if (fi < totalFrames) {
+				var base = int.!(fi) * channels;
+				for (ch < channels) s += pcm[base + ch];
+				s /= fch;
+			}
+			re[i] = s * window[i];
+			im[i] = 0.0f;
+		}
+		chromaFft(re, im, BF_FFT);
+
+		// Spectral flux: sum of positive magnitude differences (half-wave rectified)
+		var sf = 0.0f, sl = 0.0f;
+		for (b < BF_BINS) {
+			var mag = float.sqrt(re[b] * re[b] + im[b] * im[b]);
+			var diff = mag - prev[b];
+			if (diff > 0.0f) { sf += diff; if (b < lowBins) sl += diff; }
+			prev[b] = mag;
+		}
+		flux[f] = sf;
+		lowf[f] = sl;
+	}
+
+	// Normalise the ODF to unit standard deviation.
+	var mean = 0.0;
+	for (i < n) mean += flux[i];
+	mean /= n;
+	var v = 0.0;
+	for (i < n) { var d = flux[i] - mean; v += d * d; }
+	var inv = if(v > 1e-12, float.roundd(1.0 / double.sqrt(v / n)), 1.0f);
+	for (i < n) flux[i] *= inv;
+	for (i < n) lowf[i] *= inv;
+	return FluxResult.new(flux, lowf);
+}
+
+// Step 2a: raw onset times (local maxima above adaptive threshold).
+def findOnsets(flux: Array<float>, n: int, tStart: double, sampleRate: int,
+		thresholdMult: float, times: Array<double>, maxCount: int) -> int {
+	var count = 0;
+	if (n < 3) return 0;
+	var sum = 0.0f, sum2 = 0.0f;
+	for (i < n) { sum += flux[i]; sum2 += flux[i] * flux[i]; }
+	var fn = float.roundi(n);
+	var mean = sum / fn;
+	var v = sum2 / fn - mean * mean;
+	var std = if(v > 0.0f, float.sqrt(v), 1e-9f);
+	var thr = mean + thresholdMult * std;
+
+	// Minimum gap between onsets (~50 ms)
+	var hopSec = double.!(BF_HOP) / sampleRate;
+	var minGap = int.truncd(0.05 / hopSec);
+	if (minGap < 1) minGap = 1;
+	var last = -minGap * 2;
+
+	for (i = 1; i < n - 1 && count < maxCount; i++) {
+		if (flux[i] > thr && flux[i] > flux[i - 1] && flux[i] >= flux[i + 1]
+				&& (i - last) >= minGap) {
+			times[count++] = tStart + double.!(i) * hopSec;
+			last = i;
+		}
+	}
+	return count;
+}
+
+// Step 2b: estimate beat period in ODF frames via autocorrelation.
+def autocorr(x: Array<float>, n: int, acMax: int) -> Array<float> {
+	var mean = 0.0;
+	for (i < n) mean += x[i];
+	mean /= n;
+	var v = 0.0;
+	for (i < n) { var d = x[i] - mean; v += d * d; }
+	if (v < 1e-12) return null;
+	var ac = Array<float>.new(acMax + 1);
+	for (lag = 1; lag <= acMax; lag++) {
+		var s = 0.0;
+		var cnt = n - lag;
+		for (i < cnt) s += (x[i] - mean) * (x[i + lag] - mean);
+		ac[lag] = float.roundd(s / v);
+	}
+	return ac;
+}
+def acAt(ac: Array<float>, acMax: int, lag: float) -> float {
+	if (ac == null) return 0.0f;
+	var l0 = int.truncf(lag);
+	if (l0 < 1 || l0 + 1 > acMax) return 0.0f;
+	var fr = lag - float.roundi(l0);
+	return ac[l0] * (1.0f - fr) + ac[l0 + 1] * fr;
+}
+def estimatePeriod(flux: Array<float>, lowflux: Array<float>, n: int,
+		minBpm: float, maxBpm: float, sampleRate: int) -> float {
+	var fps = float.roundi(sampleRate) / float.roundi(BF_HOP);
+	var lagMin = int.truncf(fps * 60.0f / maxBpm);
+	var lagMax = int.truncf(fps * 60.0f / minBpm);
+	if (lagMin < 1) lagMin = 1;
+	if (lagMax >= n / 2) lagMax = n / 2 - 1;
+	if (lagMin > lagMax) return fps;
+
+	// De-meaned, variance-normalised autocorrelation out to 3*lagMax.
+	var acMax = DspMath.imin(n - 1, 3 * lagMax);
+	var ac = autocorr(flux, n, acMax);
+	if (ac == null) return fps;
+	// The same over the low-band ODF (breaks the octave tie).
+	var acl = if(lowflux != null, autocorr(lowflux, n, acMax));
+
+	// Harmonic scoring with a mild log-Gaussian tempo prior (centre 120 BPM).
+	var bestVal = -1e9f;
+	var bestLag = float.roundi(lagMin);
+	for (lag = lagMin; lag <= lagMax; lag++) {
+		var fl = float.roundi(lag);
+		var sec = fl / fps;
+		var lg = log2f(sec / 0.6f);
+		var prior = DspMath.expf(-0.5f * lg * lg / (1.4f * 1.4f));
+		var val = prior * (acAt(ac, acMax, fl) + 0.5f * acAt(ac, acMax, 2.0f * fl)
+				+ 0.33f * acAt(ac, acMax, 3.0f * fl)
+				+ acAt(acl, acMax, fl) + 0.5f * acAt(acl, acMax, 2.0f * fl));
+		if (val > bestVal) { bestVal = val; bestLag = fl; }
+	}
+	return bestLag;
+}
+
+// Step 3: median of an array (in-place selection sort, returns mid element).
+def arrayMedian(a: Array<float>, n: int) -> float {
+	for (i < n - 1) {
+		var m = i;
+		for (j = i + 1; j < n; j++) if (a[j] < a[m]) m = j;
+		var t = a[i]; a[i] = a[m]; a[m] = t;
+	}
+	return a[n / 2];
+}
+
+// Step 4: Ellis-style DP beat tracker.
+// C[t] = ODF[t] + max_{t'} [ C[t'] - tightness * log(delta/tau)^2 ]
+def dpBeatTrack(flux: Array<float>, n: int, tau: float, tightness: float,
+		beatFrames: Array<int>, maxBeats: int) -> int {
+	if (n < 2 || tau < 1.0f) return 0;
+	var score = Array<float>.new(n);
+	var prev = Array<int>.new(n);
+	for (t < n) { score[t] = flux[t]; prev[t] = -1; }
+
+	for (t = 1; t < n; t++) {
+		// Search range: 0.5 * tau to 2.5 * tau back
+		var ft = float.roundi(t);
+		var tLo = int.truncf(ft - 2.5f * tau);
+		var tHi = int.truncf(ft - 0.5f * tau);
+		if (tLo < 0) tLo = 0;
+		if (tHi < 0 || tHi >= t) tHi = t - 1;
+
+		var bestVal = -1e30f;
+		var bestP = -1;
+		for (p = tLo; p <= tHi; p++) {
+			var delta = float.roundi(t - p);
+			var ratio = delta / tau;
+			var logr = DspMath.logf(ratio);
+			var val = score[p] - tightness * logr * logr;
+			if (val > bestVal) { bestVal = val; bestP = p; }
+		}
+		if (bestP >= 0) {
+			score[t] = flux[t] + bestVal;
+			prev[t] = bestP;
+		}
+	}
+
+	// Find best end frame (search last half of track)
+	var bestSc = -1e30f;
+	var endT = n - 1;
+	for (t = n / 2; t < n; t++) {
+		if (score[t] > bestSc) { bestSc = score[t]; endT = t; }
+	}
+
+	// Backtrack
+	var tmp = Array<int>.new(MAX_BEAT_CANDS);
+	var cnt = 0;
+	var t = endT;
+	while (t >= 0 && cnt < maxBeats) {
+		tmp[cnt++] = t;
+		t = prev[t];
+	}
+	// Reverse to chronological order
+	for (i < cnt) beatFrames[i] = tmp[cnt - 1 - i];
+	return cnt;
+}
+
+// Result of the full algorithm.
+class AutoBeatList {
+	def beatTimes = Array<double>.new(MAX_BEAT_CANDS);
+	var beatCount: int;
+	def onsetTimes = Array<double>.new(MAX_BEAT_CANDS);
+	var onsetCount: int;
+	var estimatedBpm: float;
+	var phaseFlipped: bool;
+	// Intermediate results, kept so the benchmark can checksum them.
+	var flux: Array<float>;		// unit-variance ODF
+	var lowflux: Array<float>;	// low-band ODF
+	var tau: float;			// beat period in ODF frames
+	var dpFrames: Array<int>;	// DP beat frames (after phase check)
+}
+
+def beatSpectralFlux(pcm: Array<float>, frameCount: int, channels: int, sampleRate: int,
+		tStart: double, tEnd: double, out: AutoBeatList) {
+	out.beatCount = 0;
+	out.onsetCount = 0;
+	out.estimatedBpm = 0.0f;
+	if (pcm == null || frameCount == 0 || sampleRate == 0) return;
+	var preSec = double.!(PRE_ONSET_MS) / 1000.0;
+
+	// 1. Spectral flux ODF (plus a low-band ODF for downbeat-phase checks)
+	var fr = computeFlux(pcm, frameCount, channels, sampleRate, tStart, tEnd);
+	if (fr == null || fr.flux.length < 4) return;
+	var flux = fr.flux, lowflux = fr.low, nFlux = flux.length;
+	out.flux = flux;
+	out.lowflux = lowflux;
+
+	var hopSec = double.!(BF_HOP) / sampleRate;
+
+	// 2. Raw onsets
+	out.onsetCount = findOnsets(flux, nFlux, tStart, sampleRate, ONSET_THRESHOLD,
+		out.onsetTimes, MAX_BEAT_CANDS);
+
+	// 3. Period estimation
+	var tau = estimatePeriod(flux, lowflux, nFlux, MIN_BPM, MAX_BPM, sampleRate);
+	if (tau < 1.0f) tau = 1.0f;
+	out.tau = tau;
+	var tauSec = tau * hopSec;
+	out.estimatedBpm = 60.0f / float.roundd(tauSec);
+
+	// 4. DP beat tracking
+	var beatFrames = Array<int>.new(MAX_BEAT_CANDS);
+	var beatCount = dpBeatTrack(flux, nFlux, tau, DP_TIGHTNESS, beatFrames, MAX_BEAT_CANDS);
+	if (beatCount == 0) return;
+
+	// 4.5. Downbeat-phase check: if the half-period-shifted grid collects clearly
+	// more low-band flux, flip the phase.
+	if (lowflux != null && beatCount >= 8) {
+		var half = int.truncf(tau * 0.5f + 0.5f);
+		var on = 0.0f, shifted = 0.0f;
+		for (i < beatCount) {
+			on += lowAt(lowflux, nFlux, beatFrames[i]);
+			shifted += lowAt(lowflux, nFlux, beatFrames[i] + half);
+		}
+		if (shifted > 1.3f * on) {
+			out.phaseFlipped = true;
+			for (i < beatCount) {
+				beatFrames[i] += half;
+				if (beatFrames[i] >= nFlux) beatFrames[i] = nFlux - 1;
+			}
+		}
+	}
+
+	out.dpFrames = Array<int>.new(beatCount);
+	for (i < beatCount) out.dpFrames[i] = beatFrames[i];
+
+	// 6. Convert frame indices to times; apply pre-onset shift
+	var cnt = 0;
+	for (i < beatCount) {
+		if (cnt >= MAX_BEAT_CANDS) break;
+		var t = tStart + double.!(beatFrames[i]) * hopSec - preSec;
+		if (t < 0.0) t = 0.0;
+		out.beatTimes[cnt] = t;
+		cnt++;
+	}
+	out.beatCount = cnt;
+}
+def lowAt(lowflux: Array<float>, nFlux: int, f: int) -> float {
+	var best = 0.0f;
+	for (d = -1; d <= 1; d++) {
+		var i = f + d;
+		if (i >= 0 && i < nFlux && lowflux[i] > best) best = lowflux[i];
+	}
+	return best;
+}
+
+def BPM = 100.0;	// tempo of inputs/BeatTrack-100bpm.wav (see inputs/songs.list)
+
+// Usage: BeatTrack <clip.wav> <seconds>
+// The clip is tiled to <seconds> of audio before timing-relevant work begins.
+def main(args: Array<string>) -> int {
+	if (args.length < 2) { System.puts("Usage: BeatTrack <clip.wav> <seconds>\n"); return 1; }
+	var seconds = Int.parse(args[1]);
+	var song = SynthSong.new();
+	song.sampleRate = 22050;
+	song.channels = 1;
+	song.bpm = BPM;
+	song.roots = [0, 9, 5, 7, 2];
+	song.minors = [false, true, false, false, true];
+	song.seconds = seconds;
+	song.loadTiled(args[0]);
+
+	var out = AutoBeatList.new();
+	beatSpectralFlux(song.pcm, song.frames, song.channels, song.sampleRate, 0.0, seconds, out);
+	return if(report(out, song), 0, 1);
+}
+
+var failures = 0;
+def check(desc: string, ok: bool) {
+	System.puts("check "); System.puts(desc); System.puts(": ");
+	System.puts(if(ok, "PASS", "FAIL"));
+	System.ln();
+	if (!ok) failures++;
+}
+
+// Print a summary that consumes every computed result, then ground-truth
+// assertions (the C++ reference harness in ref/ prints the same lines).
+// Returns false if any assertion fails.
+def report(out: AutoBeatList, song: SynthSong) -> bool {
+	var gt = song.beatTimes;
+	var n = if(out.flux != null, out.flux.length, 0);
+	DspOut.label("odf-frames"); System.puti(n); System.ln();
+	DspOut.label("flux-sum"); System.puti(DspOut.checksum(out.flux, 0, n)); System.ln();
+	DspOut.label("low-sum"); System.puti(DspOut.checksum(out.lowflux, 0, n)); System.ln();
+	var fsum = 0.0, lsum = 0.0;
+	for (i < n) { fsum += out.flux[i]; lsum += out.lowflux[i]; }
+	DspOut.label("flux-total"); DspOut.putd(fsum, 3); System.ln();
+	DspOut.label("low-total"); DspOut.putd(lsum, 3); System.ln();
+	DspOut.label("tau"); DspOut.putf(out.tau, 2); System.ln();
+	DspOut.label("bpm"); DspOut.putf(out.estimatedBpm, 2); System.ln();
+	DspOut.label("onsets"); System.puti(out.onsetCount); System.ln();
+	var otimes = Array<float>.new(out.onsetCount);
+	for (i < otimes.length) otimes[i] = float.roundd(out.onsetTimes[i]);
+	DspOut.label("onset-sum"); System.puti(DspOut.checksum(otimes, 0, otimes.length)); System.ln();
+	DspOut.label("beats"); System.puti(out.beatCount); System.ln();
+	var btimes = Array<float>.new(out.beatCount);
+	for (i < btimes.length) btimes[i] = float.roundd(out.beatTimes[i]);
+	DspOut.label("beat-sum"); System.puti(DspOut.checksum(btimes, 0, btimes.length)); System.ln();
+	DspOut.label("first");
+	for (i < DspMath.imin(8, out.beatCount)) {
+		if (i > 0) System.putc(' ');
+		DspOut.putd(out.beatTimes[i], 3);
+	}
+	System.ln();
+	// Median inter-beat interval (exercises array_median, used by the seeded path).
+	var ibi = 0.0f;
+	if (out.beatCount >= 2) {
+		var ibis = Array<float>.new(out.beatCount - 1);
+		for (i < ibis.length) ibis[i] = float.roundd(out.beatTimes[i + 1] - out.beatTimes[i]);
+		ibi = arrayMedian(ibis, ibis.length);
+	}
+	DspOut.label("median-ibi"); DspOut.putf(ibi, 4); System.ln();
+
+	// Ground truth.  The algorithm reports frame-start times minus a pre-onset
+	// shift, so beats sit a constant latency before the true onsets: measure the
+	// median signed offset to the nearest true beat, then count beats that lie
+	// within 35 ms of (true beat + offset).  Onsets likewise.
+	var bOff = medianOffset(out.beatTimes, out.beatCount, gt);
+	var bOn = countOnGrid(out.beatTimes, out.beatCount, gt, bOff);
+	var oOff = medianOffset(out.onsetTimes, out.onsetCount, gt);
+	var oOn = countOnGrid(out.onsetTimes, out.onsetCount, gt, oOff);
+	var period = 60.0 / song.bpm;
+	DspOut.label("true-bpm"); DspOut.putd(song.bpm, 2); System.ln();
+	DspOut.label("true-beats"); System.puti(gt.length); System.ln();
+	DspOut.label("beat-offset-ms"); DspOut.putd(1000.0 * bOff, 1); System.ln();
+	DspOut.label("beats-on-grid"); System.puti(bOn); System.putc('/'); System.puti(out.beatCount); System.ln();
+	DspOut.label("onset-offset-ms"); DspOut.putd(1000.0 * oOff, 1); System.ln();
+	DspOut.label("onsets-on-grid"); System.puti(oOn); System.putc('/'); System.puti(out.onsetCount); System.ln();
+
+	if (gt.length < 16) {
+		System.puts("checks skipped: input shorter than 16 beats\n");
+		return true;
+	}
+	var bpmErr = out.estimatedBpm - song.bpm;
+	check("bpm within 1 of true", bpmErr <= 1.0 && bpmErr >= -1.0);
+	// The original caps the output at MAX_BEAT_CANDS (the DP backtrack keeps the last ones).
+	var cntErr = out.beatCount - DspMath.imin(gt.length, MAX_BEAT_CANDS);
+	check("beat count within 2 of min(true, 2048)", cntErr <= 2 && cntErr >= -2);
+	var ibiErr = (ibi - period) / period;
+	check("median ibi within 2% of true period", ibiErr <= 0.02 && ibiErr >= -0.02);
+	check("beat latency within 100 ms", bOff <= 0.1 && bOff >= -0.1);
+	check("beats on grid >= 95%", bOn * 100 >= 95 * out.beatCount && out.beatCount > 0);
+	check("onsets on grid >= 90%", oOn * 100 >= 90 * out.onsetCount && out.onsetCount > 0);
+	return failures == 0;
+}
+// Signed offset from {t} to the nearest time in {gt}.
+def nearestOffset(t: double, gt: Array<double>) -> double {
+	var best = 1e9;
+	for (g in gt) {
+		var d = t - g;
+		if (d * d < best * best) best = d;
+	}
+	return best;
+}
+def medianOffset(times: Array<double>, n: int, gt: Array<double>) -> float {
+	if (n == 0) return 0.0f;
+	var offs = Array<float>.new(n);
+	for (i < n) offs[i] = float.roundd(nearestOffset(times[i], gt));
+	return arrayMedian(offs, n);
+}
+def countOnGrid(times: Array<double>, n: int, gt: Array<double>, off: double) -> int {
+	var matched = 0;
+	for (i < n) {
+		var d = nearestOffset(times[i] - off, gt);
+		if (d < 0.035 && d > -0.035) matched++;
+	}
+	return matched;
+}

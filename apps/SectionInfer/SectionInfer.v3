@@ -1,0 +1,1109 @@
+// Copyright 2026 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Section inference benchmark: a port of the section-inference core of
+// beatmapper's complete_algo.cpp:
+//   - build_beat_features (rhythm map from onset shapes), vec_cosine,
+//     avg_chroma/avg_rhythm/avg_timbre, range_similarity
+//   - FeatSums prefix sums, block_sim, KindPrior, partition_span and
+//     sections_partition (the DP that tiles uncovered spans with template blocks)
+//   - sections_from_templates (sliding template matches) + suppress_overlaps
+//   - sections_from_repeats (discovery of repeated blocks by self-similarity)
+// Input is synthetic per-beat features rather than audio: a song with a known
+// structure (Intro, R x (Verse Chorus), Bridge, Chorus, Outro), each section a
+// chord loop with its own drum pattern and spectral balance, plus deterministic
+// noise.  The intro, first verse and first chorus are "mapped" (templates); the
+// rest is inferred and compared with the truth.  Inference runs twice: in the
+// default partition mode and in sliding-template mode.
+// (attach_template_chords is omitted: the chord lane is empty, where the original
+// returns -1 without effect.)
+
+// Section kinds (sectionmap.h)
+def SK_INTRO = 0;
+def SK_VERSE = 1;
+def SK_CHORUS = 3;
+def SK_BRIDGE = 5;
+def SK_OUTRO = 10;
+def SK_COUNT = 12;
+def KIND_NAMES = ["intro", "verse", "pre-chorus", "chorus", "post-chorus",
+	"bridge", "breakdown", "instrumental", "solo", "interlude", "outro", "refrain"];
+
+// complete_params_defaults (sections)
+class Params {
+	var gap_factor = 1.8f;
+	var section_granularity = 0;
+	var section_sim_threshold = 0.75f;
+	var section_max_overlap = 0.10f;
+	var section_rhythm_weight = 0.4f;
+	var section_discover = true;
+	var section_partition = true;
+	var section_block_penalty = 1.0f;
+	var section_ext_penalty = 0.01f;
+	var section_trunc_penalty = 0.04f;
+	var section_prior_weight = 0.5f;
+	var section_phase_lock = true;
+	var section_timbre_weight = 0.45f;
+	var section_timbre_bands = 24;
+	var section_min_measures = 4;
+	var section_start_margin = -1.0f;
+	var slots_per_beat = 12;	// ShapeParams default
+}
+
+class Section(t_start: double, t_end: double, kind: int, label: string, ts_num: int, ts_den: int) { }
+
+class Cand {
+	var t0: double;
+	var t1: double;
+	var score: float;
+	var sim: float;
+	var selected: bool;
+	var sec_kind: int;
+	var label: string;
+	var source: string;
+	var ts_num: int;
+	var ts_den: int;
+}
+
+// Synthetic stand-in for the onset shape analysis (onset_shape.h).
+class ShapeAnalysis {
+	var k: int;			// vocabulary size
+	var onset_t: Array<double>;
+	var onset_energy: Array<float>;
+	var onset_soft: Array<float>;	// n * k
+	var n: int;
+}
+
+class Vec<T> {
+	var a: Array<T> = Array<T>.new(16);
+	var n = 0;
+	def add(x: T) -> this {
+		if (n == a.length) {
+			var na = Array<T>.new(a.length * 2);
+			for (i < n) na[i] = a[i];
+			a = na;
+		}
+		a[n++] = x;
+	}
+	def clear() { n = 0; }
+}
+
+// Stable merge sort with a "less" predicate.
+def msort<T>(a: Array<T>, n: int, less: (T, T) -> bool) {
+	if (n < 2) return;
+	var tmp = Array<T>.new(n);
+	msortRec(a, tmp, 0, n, less);
+}
+def msortRec<T>(a: Array<T>, tmp: Array<T>, lo: int, hi: int, less: (T, T) -> bool) {
+	if (hi - lo < 2) return;
+	var mid = (lo + hi) / 2;
+	msortRec(a, tmp, lo, mid, less);
+	msortRec(a, tmp, mid, hi, less);
+	var i = lo, j = mid, k = lo;
+	while (i < mid && j < hi) {
+		if (less(a[j], a[i])) tmp[k++] = a[j++];
+		else tmp[k++] = a[i++];
+	}
+	while (i < mid) tmp[k++] = a[i++];
+	while (j < hi) tmp[k++] = a[j++];
+	for (x = lo; x < hi; x++) a[x] = tmp[x];
+}
+
+def fabs(x: double) -> double { return if(x < 0.0, -x, x); }
+
+// ---------------------------------------------------------------------------
+// Beat map helpers
+// ---------------------------------------------------------------------------
+var beats: Array<double>;	// the beat map (times)
+
+def median_ibi() -> double {
+	if (beats.length < 2) return 0.5;
+	var d = Array<double>.new(beats.length - 1);
+	for (i = 1; i < beats.length; i++) d[i - 1] = beats[i] - beats[i - 1];
+	msort(d, d.length, dless);
+	return d[d.length / 2];
+}
+def dless(a: double, b: double) -> bool { return a < b; }
+
+// Index of the first beat at or after t.
+def first_beat_at(t: double) -> int {
+	var lo = 0, hi = beats.length;
+	while (lo < hi) { var m = (lo + hi) / 2; if (beats[m] < t) lo = m + 1; else hi = m; }
+	return lo;
+}
+def nearest_beat(t: double) -> int {
+	var i = first_beat_at(t);
+	if (i >= beats.length) return beats.length - 1;
+	if (i > 0 && t - beats[i - 1] < beats[i] - t) return i - 1;
+	return i;
+}
+def overlap_len(a0: double, a1: double, b0: double, b1: double) -> double {
+	var o = DspMath.dmin(a1, b1) - DspMath.dmax(a0, b0);
+	return if(o > 0.0, o, 0.0);
+}
+// Beats [b, b+n] all mapped with no gap inside.
+def contiguous(b: int, n: int, gap_thresh: double) -> bool {
+	if (b < 0 || b + n >= beats.length) return false;
+	for (i = b + 1; i <= b + n; i++) if (beats[i] - beats[i - 1] > gap_thresh) return false;
+	return true;
+}
+def section_name(sec: Section) -> string {
+	var k = KIND_NAMES[sec.kind];
+	if (sec.label.length == 0) return k;
+	var r = Array<byte>.new(k.length + 1 + sec.label.length);
+	for (i < k.length) r[i] = k[i];
+	r[k.length] = ' ';
+	for (i < sec.label.length) r[k.length + 1 + i] = sec.label[i];
+	return r;
+}
+
+// ---------------------------------------------------------------------------
+// Beat features
+// ---------------------------------------------------------------------------
+class BeatFeatures {
+	var n = 0;
+	var rdim = 0;
+	var rhythm: Array<float>;
+	var tdim = 0;
+	var tw = 0.0f;
+	var timbre: Array<float>;
+	var chroma: Array<float>;	// cache entries, 12 per interval
+	var nchroma: int;
+	def copy() -> BeatFeatures {
+		var f = BeatFeatures.new();
+		f.n = n; f.rdim = rdim; f.rhythm = rhythm; f.tdim = tdim; f.tw = tw;
+		f.timbre = timbre; f.chroma = chroma; f.nchroma = nchroma;
+		return f;
+	}
+}
+
+def shape_onset_at(sa: ShapeAnalysis, t: double) -> int {	// lower_bound
+	var lo = 0, hi = sa.n;
+	while (lo < hi) { var m = (lo + hi) / 2; if (sa.onset_t[m] < t) lo = m + 1; else hi = m; }
+	return lo;
+}
+
+def build_beat_features(chroma: Array<float>, sa: ShapeAnalysis, slots: int, f: BeatFeatures) {
+	f.n = if(beats.length > 0, beats.length - 1, 0);
+	f.chroma = chroma;
+	f.nchroma = chroma.length / 12;
+	f.rdim = 0;
+	f.rhythm = Array<float>.new(0);
+	f.tdim = 0; f.tw = 0.0f;
+	f.timbre = Array<float>.new(0);
+	// (timbre from audio: supplied directly by the caller here)
+	if (sa == null || slots < 1 || f.n <= 0) return;
+	var K = sa.k;
+	f.rdim = slots * K;
+	f.rhythm = Array<float>.new(f.n * f.rdim);
+	for (i < f.n) {
+		var a = beats[i], b = beats[i + 1];
+		if (b <= a) continue;
+		var ia = shape_onset_at(sa, a), ib = shape_onset_at(sa, b);
+		var v = i * f.rdim;
+		for (o = ia; o < ib; o++) {
+			var s = int.truncd((sa.onset_t[o] - a) / (b - a) * slots);
+			if (s < 0) s = 0;
+			if (s >= slots) s = slots - 1;
+			var pres = 0.3f + 0.7f * (sa.onset_energy[o] + 40.0f) / 40.0f;
+			if (pres < 0.3f) pres = 0.3f;
+			if (pres > 1.0f) pres = 1.0f;
+			for (c < K) {
+				var x = pres * sa.onset_soft[o * K + c];
+				if (x > f.rhythm[v + s * K + c]) f.rhythm[v + s * K + c] = x;
+			}
+		}
+	}
+}
+
+def vec_cosine(a: Array<float>, ao: int, b: Array<float>, bo: int, n: int) -> float {
+	var dot = 0.0f, na = 0.0f, nb = 0.0f;
+	for (i < n) {
+		var x = a[ao + i], y = b[bo + i];
+		dot += x * y; na += x * x; nb += y * y;
+	}
+	if (na < 1e-12f || nb < 1e-12f) return 0.0f;
+	return dot / float.sqrt(na * nb);
+}
+def chroma_cosine(a: Array<float>, b: Array<float>) -> float { return vec_cosine(a, 0, b, 0, 12); }
+
+def avg_chroma(f: BeatFeatures, i0: int, i1: int, out: Array<float>) {
+	for (k < 12) out[k] = 0.0f;
+	var n = 0;
+	for (i = i0; i < i1 && i < f.nchroma; i++) {
+		for (k < 12) out[k] += f.chroma[i * 12 + k];
+		n++;
+	}
+	if (n != 0) for (k < 12) out[k] /= float.!(n);
+}
+def avg_rhythm(f: BeatFeatures, i0: int, i1: int, out: Array<float>) {
+	for (k < f.rdim) out[k] = 0.0f;
+	var n = 0;
+	for (i = i0; i < i1 && i < f.n; i++) {
+		var base = i * f.rdim;
+		for (k < f.rdim) out[k] += f.rhythm[base + k];
+		n++;
+	}
+	if (n != 0) for (k < f.rdim) out[k] /= float.!(n);
+}
+def avg_timbre(f: BeatFeatures, i0: int, i1: int, out: Array<float>) {
+	for (k < f.tdim) out[k] = 0.0f;
+	var n = 0;
+	for (i = i0; i < i1 && i < f.n; i++) {
+		var base = i * f.tdim;
+		for (k < f.tdim) out[k] += f.timbre[base + k];
+		n++;
+	}
+	if (n != 0) for (k < f.tdim) out[k] /= float.!(n);
+}
+def timbre_sim(a: Array<float>, b: Array<float>, n: int) -> float {
+	return 0.5f * (1.0f + vec_cosine(a, 0, b, 0, n));
+}
+
+// Similarity of beats [a, a+n) vs [b, b+n), compared `group` beats at a time.
+def range_similarity(f: BeatFeatures, a: int, b: int, n: int, group: int, rw: float) -> float {
+	if (group < 1) group = 1;
+	if (f.rdim == 0) rw = 0.0f;
+	var tw = if(f.tdim != 0, f.tw, 0.0f);
+	var sum = 0.0f, cnt = 0;
+	var va = Array<float>.new(12), vb = Array<float>.new(12);
+	var ra = Array<float>.new(f.rdim), rb = Array<float>.new(f.rdim);
+	var ta = Array<float>.new(f.tdim), tb = Array<float>.new(f.tdim);
+	for (k = 0; k < n; k += group) {
+		var g = DspMath.imin(group, n - k);
+		avg_chroma(f, a + k, a + k + g, va);
+		avg_chroma(f, b + k, b + k + g, vb);
+		var s = chroma_cosine(va, vb);
+		if (rw > 0.0f) {
+			avg_rhythm(f, a + k, a + k + g, ra);
+			avg_rhythm(f, b + k, b + k + g, rb);
+			s = (1.0f - rw) * s + rw * vec_cosine(ra, 0, rb, 0, f.rdim);
+		}
+		if (tw > 0.0f) {
+			avg_timbre(f, a + k, a + k + g, ta);
+			avg_timbre(f, b + k, b + k + g, tb);
+			s = (1.0f - tw) * s + tw * timbre_sim(ta, tb, f.tdim);
+		}
+		sum += s;
+		cnt++;
+	}
+	return if(cnt != 0, sum / float.!(cnt), 0.0f);
+}
+
+// ---------------------------------------------------------------------------
+// Section inference
+// ---------------------------------------------------------------------------
+def section_overlap(sm: Array<Section>, t0: double, t1: double) -> double {
+	var ov = 0.0;
+	for (s in sm) ov += overlap_len(t0, t1, s.t_start, s.t_end);
+	return ov;
+}
+
+def suppress_less(x: Cand, y: Cand) -> bool {
+	var lx = x.t1 - x.t0, ly = y.t1 - y.t0;
+	if (fabs(lx - ly) > 0.5) return lx > ly;
+	return x.score > y.score;
+}
+// Keep the best candidates that do not overlap a kept one by > 25%.
+def suppress_overlaps(found: Vec<Cand>, kept: Vec<Cand>) {
+	msort(found.a, found.n, suppress_less);
+	for (i < found.n) {
+		var c = found.a[i];
+		var clash = false;
+		for (j < kept.n) {
+			var k = kept.a[j];
+			if (overlap_len(c.t0, c.t1, k.t0, k.t1) > 0.25 * (c.t1 - c.t0)) { clash = true; break; }
+		}
+		if (!clash) kept.add(c);
+	}
+}
+
+class SecTemplate {
+	var b0: int;
+	var n: int;
+	var kind: int;
+	var label: string;
+	var name: string;
+	var ts_num: int;
+	var ts_den: int;
+}
+
+// Prefix sums of the per-interval features, so any range's mean is O(dim).
+class FeatSums {
+	var n = 0;
+	var rdim = 0;
+	var pc: Array<double>;
+	var pr: Array<double>;
+	var tdim = 0;
+	var tw = 0.0f;
+	var pt: Array<double>;
+	def build(f: BeatFeatures) {
+		n = f.n; rdim = f.rdim; tdim = f.tdim; tw = f.tw;
+		pc = Array<double>.new((n + 1) * 12);
+		pr = Array<double>.new((n + 1) * if(rdim != 0, rdim, 1));
+		pt = Array<double>.new((n + 1) * if(tdim != 0, tdim, 1));
+		for (i < n) {
+			var hasv = i < f.nchroma;
+			for (k < 12) pc[(i + 1) * 12 + k] = pc[i * 12 + k] + if(hasv, f.chroma[i * 12 + k], 0.0f);
+			if (rdim != 0) {
+				for (k < rdim) pr[(i + 1) * rdim + k] = pr[i * rdim + k] + f.rhythm[i * rdim + k];
+			}
+			if (tdim != 0) {
+				for (k < tdim) pt[(i + 1) * tdim + k] = pt[i * tdim + k] + f.timbre[i * tdim + k];
+			}
+		}
+	}
+	// Cosine of the mean feature over [a0,a1) vs [b0,b1), chroma+rhythm(+timbre) blended.
+	def cos_range(a0: int, a1: int, b0: int, b1: int, rw: float) -> float {
+		var dot = 0.0, na = 0.0, nb = 0.0;
+		for (k < 12) {
+			var x = (pc[a1 * 12 + k] - pc[a0 * 12 + k]) / (a1 - a0);
+			var y = (pc[b1 * 12 + k] - pc[b0 * 12 + k]) / (b1 - b0);
+			dot += x * y; na += x * x; nb += y * y;
+		}
+		var cs = if(na > 1e-12 && nb > 1e-12, float.roundd(dot / double.sqrt(na * nb)), 0.0f);
+		var s = cs;
+		if (rdim != 0 && rw > 0.0f) {
+			dot = na = nb = 0.0;
+			for (k < rdim) {
+				var x = (pr[a1 * rdim + k] - pr[a0 * rdim + k]) / (a1 - a0);
+				var y = (pr[b1 * rdim + k] - pr[b0 * rdim + k]) / (b1 - b0);
+				dot += x * y; na += x * x; nb += y * y;
+			}
+			var cr = if(na > 1e-12 && nb > 1e-12, float.roundd(dot / double.sqrt(na * nb)), 0.0f);
+			s = (1.0f - rw) * cs + rw * cr;
+		}
+		if (tdim == 0 || tw <= 0.0f) return s;
+		dot = na = nb = 0.0;
+		for (k < tdim) {
+			var x = (pt[a1 * tdim + k] - pt[a0 * tdim + k]) / (a1 - a0);
+			var y = (pt[b1 * tdim + k] - pt[b0 * tdim + k]) / (b1 - b0);
+			dot += x * y; na += x * x; nb += y * y;
+		}
+		var ct = if(na > 1e-12 && nb > 1e-12, float.roundd(dot / double.sqrt(na * nb)), 0.0f);
+		return (1.0f - tw) * s + tw * 0.5f * (1.0f + ct);
+	}
+}
+
+// Similarity of template t placed at beat x with block length len (intervals).
+def block_sim(fs: FeatSums, t: SecTemplate, x: int, len: int, ts: int, rw: float) -> float {
+	var sum = 0.0f, cnt = 0;
+	for (m = 0; m * ts < len; m++) {
+		var d0 = x + m * ts, d1 = DspMath.imin(x + (m + 1) * ts, x + len);
+		var tm = m;
+		if (tm * ts >= t.n) {	// extension: cycle the last two measures
+			var tail = DspMath.imax(1, DspMath.imin(2, t.n / ts));
+			var first_tail = t.n / ts - tail;
+			tm = first_tail + (tm - t.n / ts) % tail;
+		}
+		var s0 = t.b0 + tm * ts, s1 = DspMath.imin(t.b0 + (tm + 1) * ts, t.b0 + t.n);
+		if (s1 <= s0 || d1 <= d0) continue;
+		sum += fs.cos_range(s0, s1, d0, d1, rw);
+		cnt++;
+	}
+	return if(cnt != 0, sum / float.!(cnt), 0.0f);
+}
+
+// Bigram prior over section kinds, learned from the sections in the map.
+class KindPrior {
+	def seen = Array<int>.new((SK_COUNT + 1) * (SK_COUNT + 1));
+	def build(sm: Array<Section>) {
+		var seq = Array<(double, int)>.new(sm.length);
+		for (i < sm.length) seq[i] = (sm[i].t_start, sm[i].kind);
+		msort(seq, seq.length, pairLess);
+		for (i = 0; i + 1 < seq.length; i++) seen[seq[i].1 * (SK_COUNT + 1) + seq[i + 1].1]++;
+	}
+	def bonus(a: int, b: int) -> float {
+		if (a > SK_COUNT || b > SK_COUNT || a < 0 || b < 0) return 0.0f;
+		return if(seen[a * (SK_COUNT + 1) + b] > 0, 1.0f, -0.5f);
+	}
+}
+def pairLess(x: (double, int), y: (double, int)) -> bool {
+	return x.0 < y.0 || (x.0 == y.0 && x.1 < y.1);
+}
+def pairLessDD(x: (double, double), y: (double, double)) -> bool {
+	return x.0 < y.0 || (x.0 == y.0 && x.1 < y.1);
+}
+
+var dpCells = 0L;	// DP states relaxed (stats, printed)
+var dpBest = 0.0;	// sum of best final DP scores (printed)
+
+def partition_span(p: Params, fs: FeatSums, tm: Vec<SecTemplate>, ts: int, phase: int,
+		s0: int, s1: int, kind_l: int, kind_r: int, prior: KindPrior, kept: Vec<Cand>) {
+	var B = s1 - s0;
+	if (B < 2) return;
+	var rw = p.section_rhythm_weight;
+	var FILL = 0.45f;
+	var EXT_PEN = p.section_ext_penalty, TRUNC_PEN = p.section_trunc_penalty;
+	var PRIOR_W = p.section_prior_weight;
+	var BLOCK_PEN = p.section_block_penalty;
+	var thr = p.section_sim_threshold;
+	var gate = thr - 0.10f;
+
+	var K = SK_COUNT + 1;
+	var N = (B + 1) * K;
+	var dp = Array<double>.new(N);
+	var bk_prev = Array<int>.new(N), bk_pk = Array<int>.new(N), bk_tmpl = Array<int>.new(N);
+	var bk_len = Array<int>.new(N), bk_sim = Array<float>.new(N);
+	for (i < N) { dp[i] = -1e18; bk_prev[i] = -1; bk_tmpl[i] = -1; }
+	var k0 = if(kind_l >= 0 && kind_l < SK_COUNT, kind_l, SK_COUNT);
+	dp[k0] = 0.0;
+	for (x < B) {
+		var phase_ok = phase < 0 || ((s0 + x - phase) % ts + ts) % ts == 0;
+		for (k < K) {
+			var d = dp[x * K + k];
+			if (d < -1e17) continue;
+			dpCells++;
+			// filler, one beat; the last kind carries through
+			var ni = (x + 1) * K + k;
+			if (d + FILL > dp[ni]) {
+				dp[ni] = d + FILL;
+				bk_prev[ni] = x; bk_pk[ni] = k; bk_tmpl[ni] = -1; bk_len[ni] = 1; bk_sim[ni] = 0.0f;
+			}
+			if (!phase_ok) continue;
+			for (ti < tm.n) {
+				var t = tm.a[ti];
+				var down = int.truncd(0.4 * t.n / ts);
+				var min_len = DspMath.imax(2 * ts, t.n - down * ts);
+				var max_len = DspMath.imax(t.n + 8 * ts, int.truncd(3.5 * t.n) / ts * ts);
+				for (len = min_len; len <= max_len; len += ts) {
+					if (x + len > B) break;
+					var sim = block_sim(fs, t, s0 + x, len, ts, rw);
+					var pen = 0.0f;
+					if (len < t.n) pen = TRUNC_PEN * float.!(t.n - len) / float.!(ts);
+					if (len > t.n) pen = EXT_PEN * float.!(len - t.n) / float.!(ts);
+					var eff = sim - pen;
+					if (eff < gate) continue;
+					var sc = d + double.!(eff) * len - BLOCK_PEN + PRIOR_W * prior.bonus(k, t.kind);
+					if (x + len == B && kind_r >= 0) sc += PRIOR_W * prior.bonus(t.kind, kind_r);
+					var bi = (x + len) * K + t.kind;
+					if (sc > dp[bi]) {
+						dp[bi] = sc;
+						bk_prev[bi] = x; bk_pk[bi] = k; bk_tmpl[bi] = ti; bk_len[bi] = len; bk_sim[bi] = sim;
+					}
+				}
+			}
+		}
+	}
+	// Backtrack from the best end state
+	var bx = B, bkind = 0, best = -1e18;
+	for (k < K) if (dp[B * K + k] > best) { best = dp[B * K + k]; bkind = k; }
+	if (best < -1e17) return;
+	dpBest += best;
+	var path = Vec<int>.new();	// cell indices
+	var x = bx, k = bkind;
+	while (x > 0) {
+		var ci = x * K + k;
+		if (bk_prev[ci] < 0) break;
+		path.add(ci);
+		x = bk_prev[ci]; k = bk_pk[ci];
+	}
+	var pos = s0;
+	for (pi = path.n - 1; pi >= 0; pi--) {
+		var ci = path.a[pi];
+		var len = bk_len[ci];
+		if (bk_tmpl[ci] >= 0) {
+			var t = tm.a[bk_tmpl[ci]];
+			var cand = Cand.new();
+			cand.selected = bk_sim[ci] >= thr;
+			cand.t0 = beats[pos];
+			cand.t1 = beats[pos + len];
+			cand.sim = bk_sim[ci]; cand.score = bk_sim[ci];
+			cand.sec_kind = t.kind; cand.ts_num = t.ts_num; cand.ts_den = t.ts_den;
+			cand.label = t.label;
+			cand.source = t.name;
+			kept.add(cand);
+		}
+		pos += len;
+	}
+}
+
+def sections_partition(p: Params, f: BeatFeatures, sm: Array<Section>, duration: double,
+		gap_thresh: double, kept: Vec<Cand>) {
+	if (beats.length < 4 || sm.length == 0) return;
+	var tm = Vec<SecTemplate>.new();
+	var ts = 4;
+	for (sec in sm) {
+		var b0 = nearest_beat(sec.t_start);
+		var b1 = nearest_beat(sec.t_end);
+		var n = b1 - b0;
+		if (n < 2 || !contiguous(b0, n, gap_thresh)) continue;
+		var t = SecTemplate.new();
+		t.b0 = b0; t.n = n; t.kind = sec.kind;
+		t.ts_num = if(sec.ts_num > 0, sec.ts_num, 4);
+		t.ts_den = if(sec.ts_den > 0, sec.ts_den, 4);
+		ts = t.ts_num;
+		t.label = sec.label;
+		t.name = section_name(sec);
+		tm.add(t);
+	}
+	if (tm.n == 0) return;
+	var phase = -1;
+	{
+		// meter vote (std::map: ascending ts_num, first strict max wins)
+		var votes = Array<int>.new(65);
+		for (i < tm.n) { var q = tm.a[i].ts_num; if (q < 65) votes[q]++; }
+		var best = 0;
+		for (q < votes.length) if (votes[q] > best) { best = votes[q]; ts = q; }
+		if (p.section_phase_lock && ts > 1) {
+			var ph = Array<int>.new(ts);
+			for (i < tm.n) ph[tm.a[i].b0 % ts]++;
+			var pb = 0;
+			for (q = 1; q < ts; q++) if (ph[q] > ph[pb]) pb = q;
+			if (ph[pb] * 2 > tm.n) phase = pb;
+		}
+	}
+	{
+		var lens = Array<int>.new(tm.n);
+		for (i < tm.n) lens[i] = tm.a[i].n;
+		msort(lens, lens.length, iless);
+		var med = lens[lens.length / 2];
+		var keep = Vec<SecTemplate>.new();
+		for (i < tm.n) if (tm.a[i].n >= int.truncd(0.35 * med)) keep.add(tm.a[i]);
+		if (keep.n > 0) tm = keep;
+	}
+
+	var fs = FeatSums.new();
+	fs.build(f);
+
+	var covered = Array<(double, double)>.new(sm.length);
+	for (i < sm.length) covered[i] = (sm[i].t_start, sm[i].t_end);
+	msort(covered, covered.length, pairLessDD);
+	var spans = Vec<(double, double)>.new();
+	var cur = 0.0;
+	for (cv in covered) {
+		if (cv.0 - cur > 0.5) spans.add((cur, cv.0));
+		cur = DspMath.dmax(cur, cv.1);
+	}
+	if (duration - cur > 0.5) spans.add((cur, duration));
+
+	var prior = KindPrior.new();
+	prior.build(sm);
+	for (si < spans.n) {
+		var sp = spans.a[si];
+		var kind_l = -1, kind_r = -1;
+		for (q in sm) {
+			if (fabs(q.t_end - sp.0) < 0.3) kind_l = q.kind;
+			if (fabs(q.t_start - sp.1) < 0.3) kind_r = q.kind;
+		}
+		var s0 = nearest_beat(sp.0);
+		var s1 = nearest_beat(sp.1);
+		if (fabs(beats[s0] - sp.0) > 1.0) {
+			if (sp.0 < beats[0]) s0 = 0; else continue;
+		}
+		if (fabs(beats[s1] - sp.1) > 1.0) {
+			if (sp.1 > beats[beats.length - 1]) s1 = beats.length - 1; else continue;
+		}
+		if (s1 - s0 < 2 || !contiguous(s0, s1 - s0, gap_thresh)) continue;
+		partition_span(p, fs, tm, ts, phase, s0, s1, kind_l, kind_r, prior, kept);
+	}
+}
+def iless(a: int, b: int) -> bool { return a < b; }
+
+def sections_from_templates(p: Params, f: BeatFeatures, sm: Array<Section>, gap_thresh: double, kept: Vec<Cand>) {
+	var found = Vec<Cand>.new();
+	var nb = beats.length;
+	var rwp = p.section_rhythm_weight;
+	for (sec in sm) {
+		var b0 = nearest_beat(sec.t_start);
+		var b1 = nearest_beat(sec.t_end);
+		var n_int = b1 - b0;
+		if (n_int < 2 || !contiguous(b0, n_int, gap_thresh)) continue;
+		var group = if(p.section_granularity == 0, DspMath.imax(1, sec.ts_num), 1);
+		var src = section_name(sec);
+		for (b = 0; b + n_int < nb; b++) {
+			if (b == b0 || !contiguous(b, n_int, gap_thresh)) continue;
+			var t0 = beats[b], t1 = beats[b + n_int];
+			if (section_overlap(sm, t0, t1) > p.section_max_overlap * (t1 - t0)) continue;
+			var sim = range_similarity(f, b0, b, n_int, group, rwp);
+			if (sim < p.section_sim_threshold) continue;
+			var bp = b;
+			{
+				var l = if(b > 0 && contiguous(b - 1, n_int, gap_thresh),
+					range_similarity(f, b0, b - 1, n_int, group, rwp), -1.0f);
+				var r = if(b + 1 + n_int < nb && contiguous(b + 1, n_int, gap_thresh),
+					range_similarity(f, b0, b + 1, n_int, group, rwp), -1.0f);
+				if (l > sim || r > sim) continue;
+				var best_b = b, best_fine = -1.0f;
+				for (d = -2; d <= 2; d++) {
+					var bb = b + d;
+					if (bb < 0 || bb == b0 || bb + n_int >= nb || !contiguous(bb, n_int, gap_thresh)) continue;
+					var fine = range_similarity(f, b0, bb, n_int, 1, DspMath.fmax(rwp, 0.5f));
+					if (fine > best_fine) { best_fine = fine; best_b = bb; }
+				}
+				if (best_b != b) {
+					bp = best_b;
+					t0 = beats[bp]; t1 = beats[bp + n_int];
+					if (section_overlap(sm, t0, t1) > p.section_max_overlap * (t1 - t0)) continue;
+					sim = range_similarity(f, b0, bp, n_int, group, rwp);
+				}
+			}
+			var c = Cand.new();
+			c.t0 = t0; c.t1 = t1;
+			c.sim = sim; c.score = sim; c.selected = true;
+			c.sec_kind = sec.kind; c.ts_num = sec.ts_num; c.ts_den = sec.ts_den;
+			c.label = sec.label;
+			c.source = src;
+			found.add(c);
+		}
+	}
+	suppress_overlaps(found, kept);
+}
+
+// 2. Discovery: repeated blocks found by self-similarity, with no template.
+class Block(b: int, len: int, var grp: int, sim: float) { }
+
+class RepeatCtx(p: Params, f: BeatFeatures, sm: Array<Section>, kept: Vec<Cand>,
+		gap_thresh: double, group: int, rw: float, n_int: int) {
+	def blocks = Vec<Block>.new();
+	def covered(b: int, len: int) -> bool {
+		if (b < 0 || b + len > n_int) return true;
+		var t0 = beats[b], t1 = beats[b + len];
+		if (section_overlap(sm, t0, t1) > p.section_max_overlap * (t1 - t0)) return true;
+		for (i < kept.n) {
+			var k = kept.a[i];
+			if (overlap_len(t0, t1, k.t0, k.t1) > 0.25 * (t1 - t0)) return true;
+		}
+		for (i < blocks.n) {
+			var bl = blocks.a[i];
+			var u0 = beats[bl.b], u1 = beats[bl.b + bl.len];
+			if (overlap_len(t0, t1, u0, u1) > 0.25 * (t1 - t0)) return true;
+		}
+		return false;
+	}
+	def usable(b: int, len: int) -> bool { return !covered(b, len) && contiguous(b, len, gap_thresh); }
+	// Best similarity of [b, b+len) against any block of group g
+	def group_sim(g: int, b: int, len: int) -> float {
+		var best = -1.0f;
+		for (i < blocks.n) {
+			var bl = blocks.a[i];
+			if (bl.grp == g && bl.len == len) best = DspMath.fmax(best, range_similarity(f, bl.b, b, len, group, rw));
+		}
+		return best;
+	}
+}
+
+def LENGTHS_M = [2, 3, 4, 6, 8, 12, 16, 24, 32];
+
+def sections_from_repeats(p: Params, f: BeatFeatures, sm: Array<Section>, gap_thresh: double, kept: Vec<Cand>) {
+	var ts = 4;
+	for (s in sm) if (s.ts_num > 0) { ts = s.ts_num; break; }
+	var group = if(p.section_granularity == 0, ts, 1);
+	var n_int = beats.length - 1;
+	var min_m = if(p.section_min_measures < 1, 1, p.section_min_measures);
+	if (n_int < 2 * min_m * ts) return;
+	var rw = p.section_rhythm_weight;
+
+	var anchor = 0;
+	if (sm.length > 0) {
+		anchor = nearest_beat(sm[0].t_start) % ts;
+	} else {
+		var best = -1.0f;
+		var va = Array<float>.new(12), vb = Array<float>.new(12);
+		for (ph < ts) {
+			var sum = 0.0f, cnt = 0;
+			for (b = ph + ts; b + ts <= n_int; b += ts) {
+				avg_chroma(f, b - ts, b, va);
+				avg_chroma(f, b, b + ts, vb);
+				sum += 1.0f - chroma_cosine(va, vb);
+				cnt++;
+			}
+			var sc = if(cnt != 0, sum / float.!(cnt), 0.0f);
+			if (sc > best) { best = sc; anchor = ph; }
+		}
+	}
+
+	var rc = RepeatCtx.new(p, f, sm, kept, gap_thresh, group, rw, n_int);
+	var blocks = rc.blocks;
+	var NL = LENGTHS_M.length;
+	var next_grp = 0;
+	var grp_len = Vec<int>.new();
+
+	for (i = anchor; i + min_m * ts <= n_int; i += ts) {
+		if (rc.covered(i, ts)) continue;
+		// (a) an existing unit recurring here?  Longest unit first.
+		var best_g = -1, best_s = -1.0f;
+		for (g < next_grp) {
+			var L = grp_len.a[g];
+			if (!rc.usable(i, L)) continue;
+			var sj = rc.group_sim(g, i, L);
+			if (sj >= p.section_sim_threshold &&
+				(best_g < 0 || L > grp_len.a[best_g] || (L == grp_len.a[best_g] && sj > best_s))) {
+				best_g = g; best_s = sj;
+			}
+		}
+		if (best_g >= 0) { blocks.add(Block.new(i, grp_len.a[best_g], best_g, best_s)); continue; }
+		// (b) a new unit: shortest length that repeats back to back and is not
+		// itself internally periodic.
+		var unit = -1, unit_sim = -1.0f;
+		var fallback = -1, fallback_sim = -1.0f;
+		for (li < NL) {
+			var L = LENGTHS_M[li] * ts;
+			if (LENGTHS_M[li] < min_m) continue;
+			if (i + 2 * L > n_int) break;
+			if (!rc.usable(i, L) || !rc.usable(i + L, L)) continue;
+			var rep = range_similarity(f, i, i + L, L, group, rw);
+			if (rep < p.section_sim_threshold) continue;
+			if (fallback < 0) { fallback = L; fallback_sim = rep; }
+			var internal = if(L / 2 >= ts, range_similarity(f, i, i + L / 2, L / 2, group, rw), 1.0f);
+			if (rep > internal + 0.03f) { unit = L; unit_sim = rep; break; }
+		}
+		if (unit < 0) { unit = fallback; unit_sim = fallback_sim; }
+		if (unit < 0) continue;
+		var start = i;
+		for (o = 1; o <= 3 && p.section_start_margin >= 0.0f; o++) {
+			var b = i + o * ts;
+			if (b + 2 * unit > n_int || !rc.usable(b, unit) || !rc.usable(b + unit, unit)) break;
+			var sim = range_similarity(f, b, b + unit, unit, group, rw);
+			if (sim > unit_sim + p.section_start_margin) { start = b; unit_sim = sim; }
+		}
+		var g = next_grp++;
+		grp_len.add(unit);
+		blocks.add(Block.new(start, unit, g, unit_sim));
+		blocks.add(Block.new(start + unit, unit, g, unit_sim));
+	}
+
+	// Merge groups of the same length whose blocks are mutually similar
+	var alias = Array<int>.new(next_grp);
+	for (g < next_grp) alias[g] = g;
+	for (g < next_grp) {
+		if (alias[g] != g) continue;
+		for (h = g + 1; h < next_grp; h++) {
+			if (alias[h] != h || grp_len.a[h] != grp_len.a[g]) continue;
+			var best = -1.0f;
+			for (bi < blocks.n) {
+				var bl = blocks.a[bi];
+				if (bl.grp == h) best = DspMath.fmax(best, rc.group_sim(g, bl.b, bl.len));
+			}
+			if (best >= p.section_sim_threshold) alias[h] = g;
+		}
+	}
+	for (bi < blocks.n) blocks.a[bi].grp = alias[blocks.a[bi].grp];
+	// Renumber groups by first appearance
+	{
+		var order = Array<int>.new(next_grp);
+		for (g < next_grp) order[g] = -1;
+		var n = 0;
+		var sorted = Array<Block>.new(blocks.n);
+		for (bi < blocks.n) sorted[bi] = blocks.a[bi];
+		msort(sorted, sorted.length, blockLess);
+		for (bl in sorted) if (order[bl.grp] < 0) order[bl.grp] = n++;
+		for (bi < blocks.n) blocks.a[bi].grp = order[blocks.a[bi].grp];
+		next_grp = n;
+	}
+	if (blocks.n == 0) return;
+
+	var size = Array<int>.new(next_grp);
+	for (bi < blocks.n) size[blocks.a[bi].grp]++;
+	var chorus = 0;
+	for (g = 1; g < next_grp; g++) if (size[g] > size[chorus]) chorus = g;
+	var name_chorus = next_grp >= 2 && size[chorus] >= 3;
+
+	for (bi < blocks.n) {
+		var bl = blocks.a[bi];
+		var c = Cand.new();
+		c.t0 = beats[bl.b]; c.t1 = beats[bl.b + bl.len];
+		c.sim = bl.sim; c.score = bl.sim * 0.95f;
+		c.selected = true;
+		c.sec_kind = if(name_chorus && bl.grp == chorus, SK_CHORUS, SK_VERSE);
+		c.ts_num = ts; c.ts_den = 4;
+		var letter = byte.!('A' + (bl.grp % 26));
+		c.label = [letter];
+		c.source = repeatSource(letter, size[bl.grp]);
+		kept.add(c);
+	}
+}
+def blockLess(x: Block, y: Block) -> bool { return x.b < y.b; }
+def repeatSource(letter: byte, n: int) -> string {
+	var s = Array<byte>.new(16), p = 0;
+	for (c in "repeat ") s[p++] = c;
+	s[p++] = letter; s[p++] = ' '; s[p++] = 'x';
+	if (n >= 100) s[p++] = byte.!('0' + n / 100 % 10);
+	if (n >= 10) s[p++] = byte.!('0' + n / 10 % 10);
+	s[p++] = byte.!('0' + n % 10);
+	var r = Array<byte>.new(p);
+	for (i < p) r[i] = s[i];
+	return r;
+}
+
+def infer_sections(p: Params, f: BeatFeatures, sm: Array<Section>, duration: double,
+		gap_thresh: double, kept: Vec<Cand>) {
+	if (beats.length < 4) return;
+	if (p.section_partition) sections_partition(p, f, sm, duration, gap_thresh, kept);
+	else sections_from_templates(p, f, sm, gap_thresh, kept);
+	if (p.section_discover) {
+		var fd = f.copy();
+		fd.tw = 0.0f;
+		sections_from_repeats(p, fd, sm, gap_thresh, kept);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic song features
+// ---------------------------------------------------------------------------
+// Per-section-kind material: chord loop (one chord per bar, root + 12 if minor),
+// drum pattern (triples: beat-in-bar, 12th-of-beat position, shape), energy
+// offset and spectral slope.
+def chordsFor(kind: int) -> Array<int> {
+	match (kind) {
+		SK_VERSE => return [0, 7, 21, 5];	// C G Am F
+		SK_CHORUS => return [5, 0, 7, 21];	// F C G Am
+		SK_BRIDGE => return [14, 16, 5, 7];	// Dm Em F G
+		_ => return [21, 5, 0, 7];		// Am F C G (intro, outro)
+	}
+}
+def drumsFor(kind: int) -> Array<int> {
+	match (kind) {
+		SK_VERSE => return [0,0,0, 0,6,2, 1,0,1, 1,6,2, 2,0,0, 2,6,2, 3,0,1, 3,6,2];
+		SK_CHORUS => return [0,0,0, 0,3,2, 0,6,2, 0,9,2, 1,0,1, 1,3,2, 1,6,2, 1,9,2,
+				2,0,0, 2,3,2, 2,6,2, 2,9,2, 3,0,1, 3,3,2, 3,6,2, 3,9,2];
+		SK_BRIDGE => return [0,0,0, 0,6,2, 1,0,4, 2,0,0, 2,6,2, 3,0,3, 3,4,3, 3,8,3];
+		_ => return [0,0,0, 1,0,2, 2,0,2, 3,0,2];
+	}
+}
+def gainFor(kind: int) -> double {
+	match (kind) {
+		SK_CHORUS => return 3.0;
+		SK_VERSE => return 0.0;
+		SK_BRIDGE => return 1.0;
+		_ => return -4.0;
+	}
+}
+def SHAPE_DB = [-10.0, -14.0, -26.0, -16.0, -20.0];
+def SLOPES = [-0.8, -0.2, 0.0, 0.5, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0, -0.6, 0.0];
+
+class SongSynth {
+	var seed = 777u;
+	var K = 5;
+	var TB = 24;
+	// outputs
+	var beatTimes: Array<double>;
+	var chroma: Array<float>;
+	var timbre: Array<float>;
+	var shapes = ShapeAnalysis.new();
+	var truth = Vec<Section>.new();
+	var mapped = Vec<Section>.new();
+	var duration: double;
+
+	def rand() -> double {
+		seed = seed * 1664525u + 1013904223u;
+		return double.!(seed >> 8) / 16777216.0;
+	}
+	def generate(reps: int) -> this {
+		// structure: (kind, bars)
+		var plan = Vec<(int, int)>.new();
+		plan.add((SK_INTRO, 4));
+		for (r < reps) { plan.add((SK_VERSE, 8)); plan.add((SK_CHORUS, 8)); }
+		plan.add((SK_BRIDGE, 8));
+		plan.add((SK_CHORUS, 10));
+		plan.add((SK_OUTRO, 4));
+		var nbeats = 0;
+		for (i < plan.n) nbeats += plan.a[i].1 * 4;
+		var n = nbeats;		// intervals
+		beatTimes = Array<double>.new(n + 1);
+		for (b < n + 1) beatTimes[b] = 0.2 + b * 0.5 + 0.006 * (rand() - 0.5);
+
+		// timbre base profiles per kind
+		var base = Array<double>.new(SK_COUNT * TB);
+		for (kd < SK_COUNT) {
+			for (j < TB) base[kd * TB + j] = SLOPES[kd] * (j - 11.5) / 12.0 + 0.5 * rand();
+		}
+
+		chroma = Array<float>.new(n * 12);
+		timbre = Array<float>.new(n * TB);
+		var ot = Vec<double>.new(), oe = Vec<float>.new(), os = Vec<float>.new();
+		var b = 0;
+		var counts = Array<int>.new(SK_COUNT);
+		for (si < plan.n) {
+			var kind = plan.a[si].0, bars = plan.a[si].1;
+			var b0 = b;
+			var chords = chordsFor(kind), drums = drumsFor(kind);
+			var gain = gainFor(kind);
+			for (bar < bars) {
+				var chord = chords[bar % 4];
+				var root = chord % 12, minor = chord >= 12;
+				for (beat < 4) {
+					// chroma
+					var v = Array<double>.new(12);
+					for (k < 12) v[k] = 0.04 + 0.12 * rand();
+					v[root] += 1.0 * (0.8 + 0.2 * rand());
+					v[(root + if(minor, 3, 4)) % 12] += 0.7 * (0.8 + 0.2 * rand());
+					v[(root + 7) % 12] += 0.8 * (0.8 + 0.2 * rand());
+					var mx = 0.0;
+					for (k < 12) if (v[k] > mx) mx = v[k];
+					for (k < 12) chroma[b * 12 + k] = float.roundd(v[k] / mx);
+					// timbre: base + noise, mean-removed
+					var tv = Array<double>.new(TB), mean = 0.0;
+					for (j < TB) { tv[j] = base[kind * TB + j] + 0.25 * rand(); mean += tv[j]; }
+					mean /= TB;
+					for (j < TB) timbre[b * TB + j] = float.roundd(tv[j] - mean);
+					// onsets
+					var t = beatTimes[b], ibi = beatTimes[b + 1] - beatTimes[b];
+					for (q = 0; q < drums.length; q += 3) {
+						if (drums[q] != beat) continue;
+						var pos = drums[q + 1], shape = drums[q + 2];
+						ot.add(t + pos / 12.0 * ibi + 0.002 * rand());
+						oe.add(float.roundd(SHAPE_DB[shape] + gain + 2.0 * rand()));
+						var main = 0.55 + 0.3 * rand();
+						for (c < K) {
+							var x = if(c == shape, main, (1.0 - main) * 0.25 * (0.5 + rand()));
+							os.add(float.roundd(x));
+						}
+					}
+					b++;
+				}
+			}
+			counts[kind]++;
+			var label = Array<byte>.new(1);
+			label[0] = byte.!('0' + counts[kind] % 10);
+			var sec = Section.new(beatTimes[b0], beatTimes[b], kind, label, 4, 4);
+			truth.add(sec);
+			// mapped: the intro, the first verse and the first chorus
+			if (si <= 2) mapped.add(sec);
+		}
+		shapes.k = K;
+		shapes.n = ot.n;
+		shapes.onset_t = ot.a; shapes.onset_energy = oe.a; shapes.onset_soft = os.a;
+		duration = beatTimes[n] + 0.4;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Output
+// ---------------------------------------------------------------------------
+def puts(s: string) { System.puts(s); }
+def candTimeLess(x: Cand, y: Cand) -> bool {
+	return x.t0 < y.t0 || (x.t0 == y.t0 && (x.t1 < y.t1 || (x.t1 == y.t1 && x.sec_kind < y.sec_kind)));
+}
+def putTime(t: double) { DspOut.putd(t, 2); }
+
+def report(name: string, kept: Vec<Cand>, truth: Vec<Section>, mapped: Vec<Section>, verbose: bool) {
+	puts(name); puts(": "); DspOut.putl(kept.n); puts(" candidates"); System.ln();
+	// Reported in time order: suppress_overlaps' std::sort is not stable, so the
+	// order of exactly tied candidates is implementation-defined.
+	var sorted = Array<Cand>.new(kept.n);
+	for (i < kept.n) sorted[i] = kept.a[i];
+	msort(sorted, sorted.length, candTimeLess);
+	var h = 0, simSum = 0.0f;
+	for (i < sorted.length) {
+		var c = sorted[i];
+		var b0 = nearest_beat(c.t0), b1 = nearest_beat(c.t1);
+		h = h * 31 + b0; h = h * 31 + b1; h = h * 31 + c.sec_kind;
+		h = h * 31 + int.truncd(double.round(c.sim * 10000.0f));
+		simSum += c.sim;
+		if (verbose) {
+			puts("  "); putTime(c.t0); puts("-"); putTime(c.t1);
+			puts(" beats "); DspOut.putl(b0); puts("-"); DspOut.putl(b1);
+			puts(" "); puts(KIND_NAMES[c.sec_kind]); puts(" "); puts(c.label);
+			puts(" from \""); puts(c.source); puts("\" sim "); DspOut.putf(c.sim, 4);
+			if (!c.selected) puts(" (weak)");
+			System.ln();
+		}
+	}
+	// Truth comparison: the unmapped sections found with both edges within
+	// 0.3 s (and with the right kind, for template-derived candidates).
+	var unm = 0, edges = 0, kinds = 0;
+	for (i < truth.n) {
+		var s = truth.a[i];
+		var isMapped = false;
+		for (j < mapped.n) if (mapped.a[j] == s) isMapped = true;
+		if (isMapped) continue;
+		unm++;
+		for (j < kept.n) {
+			var c = kept.a[j];
+			if (fabs(c.t0 - s.t_start) < 0.3 && fabs(c.t1 - s.t_end) < 0.3) {
+				edges++;
+				if (c.sec_kind == s.kind) kinds++;
+				break;
+			}
+		}
+	}
+	puts("  truth: "); DspOut.putl(unm); puts(" unmapped sections, ");
+	DspOut.putl(edges); puts(" found exactly, ");
+	DspOut.putl(kinds); puts(" with the right kind; hash "); DspOut.putl(h);
+	puts(" simsum "); DspOut.putf(simSum, 4);
+	System.ln();
+
+	// Correctness checks against the known structure.
+	var vc = 0, vcOk = 0;
+	for (i < truth.n) {
+		var s = truth.a[i];
+		if (i < mapped.n || (s.kind != SK_VERSE && s.kind != SK_CHORUS)) continue;
+		vc++;
+		for (j < kept.n) {
+			var c = kept.a[j];
+			if (fabs(c.t0 - s.t_start) < 0.3 && fabs(c.t1 - s.t_end) < 0.3 && c.sec_kind == s.kind) { vcOk++; break; }
+		}
+	}
+	var overMapped = false, overEach = false;
+	for (i < kept.n) {
+		var c = kept.a[i];
+		for (j < mapped.n) {
+			var m = mapped.a[j];
+			if (overlap_len(c.t0, c.t1, m.t_start, m.t_end) > 0.10 * (c.t1 - c.t0) + 1e-9) overMapped = true;
+		}
+		for (j < i) {
+			var d = kept.a[j];
+			var ov = overlap_len(c.t0, c.t1, d.t0, d.t1);
+			if (ov > 0.25 * (c.t1 - c.t0) + 1e-9 || ov > 0.25 * (d.t1 - d.t0) + 1e-9) overEach = true;
+		}
+	}
+	puts("  unmapped verses/choruses found exactly with the right kind: ");
+	DspOut.putl(vcOk); puts("/"); DspOut.putl(vc);
+	System.ln();
+	check("unmapped verses/choruses found exactly with the right kind >= 75%", vcOk * 100 >= vc * 75);
+	check("no candidate overlaps a mapped section by > 10%", !overMapped);
+	check("no two candidates overlap by > 25%", !overEach);
+}
+
+var failures = 0;
+def check(what: string, ok: bool) {
+	puts("  check "); puts(what); puts(if(ok, ": PASS", ": FAIL"));
+	System.ln();
+	if (!ok) failures++;
+}
+
+def main(args: Array<string>) -> int {
+	var reps = Util.intArg(args, 2);
+	var syn = SongSynth.new().generate(reps);
+	beats = syn.beatTimes;
+	var p = Params.new();
+	var f = BeatFeatures.new();
+	build_beat_features(syn.chroma, syn.shapes, p.slots_per_beat, f);
+	// timbre profiles (shape_band_profile of the audio in the original)
+	f.tdim = syn.TB; f.tw = p.section_timbre_weight; f.timbre = syn.timbre;
+
+	var gap_thresh = p.gap_factor * median_ibi();
+	var sm = Array<Section>.new(syn.mapped.n);
+	for (i < sm.length) sm[i] = syn.mapped.a[i];
+
+	var verbose = reps <= 4;
+	puts("beats "); DspOut.putl(beats.length);
+	puts(" onsets "); DspOut.putl(syn.shapes.n);
+	puts(" rdim "); DspOut.putl(f.rdim);
+	puts(" tdim "); DspOut.putl(f.tdim);
+	System.ln();
+	puts("checksums chroma "); DspOut.putl(DspOut.checksum(f.chroma, 0, f.chroma.length));
+	puts(" rhythm "); DspOut.putl(DspOut.checksum(f.rhythm, 0, f.rhythm.length));
+	puts(" timbre "); DspOut.putl(DspOut.checksum(f.timbre, 0, f.timbre.length));
+	System.ln();
+	if (verbose) {
+		puts("truth:");
+		for (i < syn.truth.n) {
+			var s = syn.truth.a[i];
+			puts(" "); puts(section_name(s)); puts("@"); DspOut.putl(nearest_beat(s.t_start));
+		}
+		System.ln();
+	}
+
+	var kept = Vec<Cand>.new();
+	dpCells = 0; dpBest = 0.0;
+	infer_sections(p, f, sm, syn.duration, gap_thresh, kept);
+	report("partition", kept, syn.truth, syn.mapped, verbose);
+	puts("  dp states "); DspOut.putl(dpCells); puts(" best "); DspOut.putd(dpBest, 3); System.ln();
+
+	p.section_partition = false;
+	var kept2 = Vec<Cand>.new();
+	infer_sections(p, f, sm, syn.duration, gap_thresh, kept2);
+	report("templates", kept2, syn.truth, syn.mapped, verbose);
+	return if(failures > 0, 1, 0);
+}

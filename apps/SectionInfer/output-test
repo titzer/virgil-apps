@@ -1,0 +1,35 @@
+beats 361 onsets 1024 rdim 60 tdim 24
+checksums chroma -649380962 rhythm 1180704826 timbre -1928619348
+truth: intro 1@0 verse 1@16 chorus 1@48 verse 2@80 chorus 2@112 verse 3@144 chorus 3@176 verse 4@208 chorus 4@240 bridge 1@272 chorus 5@304 outro 1@344
+partition: 9 candidates
+  40.20-56.20 beats 80-112 verse 1 from "verse 1" sim 0.9911
+  56.20-72.20 beats 112-144 chorus 1 from "chorus 1" sim 0.9955
+  72.20-88.20 beats 144-176 verse 1 from "verse 1" sim 0.9902
+  88.20-104.20 beats 176-208 chorus 1 from "chorus 1" sim 0.9954
+  104.20-120.20 beats 208-240 verse 1 from "verse 1" sim 0.9901
+  120.20-134.20 beats 240-268 chorus 1 from "chorus 1" sim 0.9956
+  134.20-152.20 beats 268-304 chorus 1 from "chorus 1" sim 0.6619 (weak)
+  152.20-172.20 beats 304-344 chorus 1 from "chorus 1" sim 0.9611
+  172.20-180.20 beats 344-360 intro 1 from "intro 1" sim 0.9687
+  truth: 9 unmapped sections, 7 found exactly, 6 with the right kind; hash -1894827459 simsum 8.5495
+  unmapped verses/choruses found exactly with the right kind: 6/7
+  check unmapped verses/choruses found exactly with the right kind >= 75%: PASS
+  check no candidate overlaps a mapped section by > 10%: PASS
+  check no two candidates overlap by > 25%: PASS
+  dp states 800 best 253.159
+templates: 10 candidates
+  40.20-56.20 beats 80-112 verse 1 from "verse 1" sim 0.9911
+  56.20-72.20 beats 112-144 chorus 1 from "chorus 1" sim 0.9955
+  72.20-88.20 beats 144-176 verse 1 from "verse 1" sim 0.9902
+  88.20-104.20 beats 176-208 chorus 1 from "chorus 1" sim 0.9954
+  104.20-120.20 beats 208-240 verse 1 from "verse 1" sim 0.9901
+  120.20-136.20 beats 240-272 chorus 1 from "chorus 1" sim 0.9956
+  136.20-144.20 beats 272-288 verse A from "repeat A x2" sim 0.9930
+  144.20-152.20 beats 288-304 verse A from "repeat A x2" sim 0.9930
+  152.20-168.20 beats 304-336 chorus 1 from "chorus 1" sim 0.9954
+  172.20-180.20 beats 344-360 intro 1 from "intro 1" sim 0.9687
+  truth: 9 unmapped sections, 7 found exactly, 6 with the right kind; hash 1647156647 simsum 9.9081
+  unmapped verses/choruses found exactly with the right kind: 6/7
+  check unmapped verses/choruses found exactly with the right kind >= 75%: PASS
+  check no candidate overlaps a mapped section by > 10%: PASS
+  check no two candidates overlap by > 25%: PASS

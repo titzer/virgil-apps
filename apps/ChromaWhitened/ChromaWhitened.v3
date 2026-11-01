@@ -1,0 +1,191 @@
+// Copyright 2026 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Beat-synchronous whitened log-frequency chroma (beatmapper chroma_whitened.cpp,
+// Cho & Bello 2014 / Mauch 2010 front end) and its ensemble with HPS + Peaks
+// (chroma_whitened_hps_peaks), over a synthetic song tuned to A4 = 443 Hz to
+// exercise the global tuning estimate.
+//   1. log-frequency spectrum, 3 bins per semitone, with a tuning estimate
+//      from the energy phase across the sub-semitone bins;
+//   2. log compression of magnitudes;
+//   3. octave-wide Hamming-weighted mean subtraction and std normalisation
+//      ("spectral whitening");
+//   4. fold to 12 pitch classes at tuning-corrected semitone centres with a
+//      raised-cosine octave weighting centred on C4.
+def WL_N = 8192;			// FFT size
+def WL_HOP = 4096;
+def WL_BINS = WL_N / 2;
+def WL_BPS = 3;				// log-freq bins per semitone
+def WL_MIDI0 = 24.0f;			// C1 (~32.7 Hz)
+def WL_SEMIS = 84;			// C1..B7
+def WL_LF = WL_SEMIS * WL_BPS;		// log-freq bins
+def WL_HALF = 18;			// whitening half-window (1 octave)
+
+component ChromaWhitened {
+	def re = Array<float>.new(WL_N);
+	def im = Array<float>.new(WL_N);
+	def win = initWin();
+	def mag = Array<float>.new(WL_BINS);
+	def lf = Array<float>.new(WL_LF);
+	def wh = Array<float>.new(WL_LF);
+	def acc = Array<float>.new(WL_LF);
+	def hamm = initHamm();
+	// Statistics of the per-call tuning estimate (in log-freq bins).
+	var tuneSum = 0.0;
+	var tuneCount = 0;
+
+	def initWin() -> Array<float> {
+		var w = Array<float>.new(WL_N);
+		for (i < WL_N) w[i] = 0.54f - 0.46f * DspMath.cosf(2.0f * Chroma.PIF * float.roundi(i) / float.roundi(WL_N - 1));
+		return w;
+	}
+	def initHamm() -> Array<float> {
+		var w = Array<float>.new(2 * WL_HALF + 1);
+		for (i < 2 * WL_HALF + 1) w[i] = 0.54f - 0.46f * DspMath.cosf(2.0f * Chroma.PIF * float.roundi(i) / (2.0f * float.roundi(WL_HALF)));
+		return w;
+	}
+	def run(pcm: Array<float>, frameCount: int, ch: int, sr: int, t0: double, t1: double, result: Array<float>) {
+		Chroma.zero(result);
+		if (pcm == null || frameCount == 0 || ch == 0 || sr == 0) return;
+		if (t1 - t0 > 8.0) t0 = t1 - 8.0;
+		var r = Chroma.range(t0, t1, sr, frameCount), fs = r.0, fe = r.1;
+		if (fe - fs < WL_N / 2) return;
+
+		var fpb = float.roundi(sr) / float.roundi(WL_N);	// Hz per FFT bin
+		var fch = float.roundi(ch);
+		for (b < WL_LF) acc[b] = 0.0f;
+		var tuneRe = 0.0, tuneIm = 0.0;			// sub-semitone energy phase
+		var nFrames = 0;
+
+		// Short intervals still get one frame (zero-padded at the end).
+		for (pos = fs; pos < fe - WL_N / 4 && nFrames < 64; pos += WL_HOP) {
+			for (i < WL_N) {
+				var fi = pos + i;
+				var s = 0.0f;
+				if (fi < fe) for (c < ch) s += pcm[fi * ch + c];
+				re[i] = (s / fch) * win[i];
+				im[i] = 0.0f;
+			}
+			Chroma.fft(re, im, WL_N);
+			var mmax = 1e-30f;
+			for (k < WL_BINS) {
+				mag[k] = float.sqrt(re[k] * re[k] + im[k] * im[k]);
+				if (mag[k] > mmax) mmax = mag[k];
+			}
+			// Log-frequency mapping (linear interpolation) with log compression.
+			for (b < WL_LF) {
+				var midi = WL_MIDI0 + float.roundi(b) / float.roundi(WL_BPS);
+				var f = 440.0f * DspMath.powf(2.0f, (midi - 69.0f) / 12.0f);
+				var x = f / fpb;
+				var k = int.truncf(x);
+				var v = 0.0f;
+				if (k >= 1 && k + 1 < WL_BINS) {
+					var fr = x - float.roundi(k);
+					v = mag[k] * (1.0f - fr) + mag[k + 1] * fr;
+				}
+				lf[b] = Chroma.log1pf(100.0f * v / mmax);
+			}
+			// Tuning evidence: energy across the 3 sub-semitone positions, as a phase.
+			for (b < WL_LF) {
+				var sub = b % WL_BPS;
+				var ang = 2.0f * Chroma.PIF * float.roundi(sub) / float.roundi(WL_BPS);
+				tuneRe += lf[b] * DspMath.cosf(ang);
+				tuneIm += lf[b] * DspMath.sinf(ang);
+			}
+			// Whitening: Hamming-weighted running mean subtraction (clamped at
+			// zero) and std division, one octave wide.
+			for (b < WL_LF) {
+				var wsum = 0.0, mu = 0.0;
+				for (d = -WL_HALF; d <= WL_HALF; d++) {
+					var j = b + d;
+					if (j < 0 || j >= WL_LF) continue;
+					var w: double = hamm[d + WL_HALF];
+					mu += w * lf[j]; wsum += w;
+				}
+				mu = if(wsum > 0, mu / wsum, 0.0);
+				var vr = 0.0;
+				for (d = -WL_HALF; d <= WL_HALF; d++) {
+					var j = b + d;
+					if (j < 0 || j >= WL_LF) continue;
+					var w: double = hamm[d + WL_HALF];
+					var dd = lf[j] - mu;
+					vr += w * dd * dd;
+				}
+				vr = if(wsum > 0, vr / wsum, 0.0);
+				var sd = double.sqrt(vr) + 1e-3;
+				var v = (lf[b] - mu) / sd;
+				wh[b] = if(v > 0.0, float.roundd(v), 0.0f);
+			}
+			for (b < WL_LF) acc[b] += wh[b];
+			nFrames++;
+		}
+		if (nFrames == 0) return;
+
+		// Global tuning offset in log-freq bins.
+		var tune = 0.0f;
+		if (tuneRe != 0.0 || tuneIm != 0.0) {
+			var theta = DspMath.atan2f(float.roundd(tuneIm), float.roundd(tuneRe));
+			tune = theta / (2.0f * Chroma.PIF) * float.roundi(WL_BPS);
+			if (tune > 1.5f) tune -= 3.0f;
+			if (tune < -1.5f) tune += 3.0f;
+			tuneSum += tune; tuneCount++;
+		}
+
+		// Fold to pitch classes at tuning-corrected semitone centres, weighted
+		// toward the octaves chords live in (peak near C4).
+		var power = Array<double>.new(12);
+		for (s < WL_SEMIS) {
+			var x = float.roundi(s * WL_BPS + 1) + tune;	// +1: centre sub-bin
+			var b = int.truncf(float.floor(x));
+			var fr = x - float.roundi(b);
+			if (b < 0 || b + 1 >= WL_LF) continue;
+			var v = acc[b] * (1.0f - fr) + acc[b + 1] * fr;
+			var midi = WL_MIDI0 + float.roundi(s);
+			var oct = (midi - 60.0f) / 30.0f;		// C4-centred
+			var w = 0.5f * (1.0f + DspMath.cosf(Chroma.PIF * if(oct < -1.0f, -1.0f, if(oct > 1.0f, 1.0f, oct))));
+			w = 0.15f + 0.85f * w;
+			var pc = int.truncf(midi) % 12;
+			power[pc] += double.!(v) * w;
+		}
+		var mx = 1e-30;
+		for (i < 12) if (power[i] > mx) mx = power[i];
+		for (i < 12) {
+			var v = float.roundd(power[i] / mx);
+			result[i] = if(v < 0.0f, 0.0f, if(v > 1.0f, 1.0f, v));
+		}
+	}
+}
+
+// Average of whitened log-freq chroma and HPS + Peaks (chroma_whitened_hps_peaks).
+component ChromaWhitenedHpsPeaks {
+	def a = Array<float>.new(12);
+	def b = Array<float>.new(12);
+	def run(pcm: Array<float>, n: int, ch: int, sr: int, t0: double, t1: double, out: Array<float>) {
+		ChromaWhitened.run(pcm, n, ch, sr, t0, t1, a);
+		ChromaHpsPeaks.run(pcm, n, ch, sr, t0, t1, b);
+		Chroma.average(a, b, out);
+	}
+}
+
+def main(args: Array<string>) -> int {
+	var song = ChromaBench.song(args, 443.0);	// detuned clip: A4 = 443 Hz
+	var ok = ChromaBench.run(song, [
+		ChromaAlgo.new("whitened", ChromaWhitened.run, 95, 95),
+		ChromaAlgo.new("whitened_hps_peaks", ChromaWhitenedHpsPeaks.run, 95, 95)
+	]);
+	// Mean estimated tuning offset (true: 1200*log2(443/440) = 11.76 cents)
+	var t = if(ChromaWhitened.tuneCount > 0, ChromaWhitened.tuneSum / ChromaWhitened.tuneCount, 0.0);
+	var cents = t * 100.0 / WL_BPS;
+	System.puts("tuning: ");
+	DspOut.putd(t, 4);
+	System.puts(" bins = ");
+	DspOut.putd(cents, 2);
+	System.puts(" cents (");
+	DspOut.putl(ChromaWhitened.tuneCount);
+	System.puts(" estimates)\n");
+	// The estimate must have the right sign and roughly the right size.
+	var tok = cents >= 3.0 && cents <= 20.0;
+	System.puts(if(tok, "check tuning estimate in [3, 20] cents (true +11.76): PASS\n",
+		"check tuning estimate in [3, 20] cents (true +11.76): FAIL\n"));
+	return if(ok && tok, 0, 1);
+}

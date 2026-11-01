@@ -1,0 +1,34 @@
+frames: 7606 floor: -65.58 peak: -14.57
+envelope checksum: 1742142680
+units: 66 nuclei: 192 hash: 825620636 rate: 0.2303
+0 syl=9 truth=1.50 t0=1.51 t1=3.68 score=0.998 ok
+1 syl=10 truth=4.64 t0=4.65 t1=7.05 score=0.998 ok
+2 syl=9 truth=10.86 t0=10.87 t1=13.09 score=0.995 ok
+3 syl=2 truth=14.38 t0=14.40 t1=14.87 score=1.000 ok
+4 syl=10 truth=16.27 t0=16.29 t1=18.92 score=0.982 ok
+5 syl=11 truth=20.26 t0=20.27 t1=23.60 score=0.736 ok
+6 syl=4 truth=26.69 t0=26.70 t1=27.67 score=0.997 ok
+7 syl=10 truth=28.58 t0=28.59 t1=31.14 score=0.990 ok
+8 syl=8 truth=32.06 t0=32.07 t1=33.86 score=0.999 ok
+9 syl=9 truth=34.56 t0=34.56 t1=36.52 score=0.997 ok
+10 syl=11 truth=37.89 t0=37.91 t1=40.64 score=0.994 ok
+11 syl=10 truth=41.83 t0=41.84 t1=44.18 score=1.000 ok
+12 syl=4 truth=45.80 t0=45.81 t1=46.76 score=0.999 ok
+13 syl=3 truth=48.04 t0=48.04 t1=48.75 score=0.999 ok
+14 syl=9 truth=50.90 t0=50.90 t1=53.08 score=0.997 ok
+15 syl=10 truth=54.04 t0=54.05 t1=55.50 score=0.714 ok
+16 syl=9 truth=57.31 t0=55.50 t1=56.45 score=0.363
+17 syl=9 truth=60.26 t0=57.31 t1=58.09 score=0.233
+18 syl=2 truth=63.78 t0=58.09 t1=58.92 score=0.600
+19 syl=10 truth=65.67 t0=58.92 t1=59.59 score=0.105
+20 syl=11 truth=69.66 t0=65.70 t1=68.31 score=0.995
+21 syl=5 truth=73.66 t0=69.68 t1=72.03 score=0.450
+lines: 22 placed: 22 within0.5s: 16 meanScore: 0.8247 hash: -854088000
+syllables: 189
+check all lines placed: PASS
+loud lines ok: 16/17 quiet lines ok: 0/5
+check lines before the quiet chorus starting within 0.5 s of truth >= 85%: PASS
+check placements in sheet order, non-overlapping: PASS
+check no line placed over an anchor: PASS
+check syllable nuclei within 15% of sung syllables: PASS
+check singing rate within 15% of the synthesized 0.24 s: PASS

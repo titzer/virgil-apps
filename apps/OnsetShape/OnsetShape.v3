@@ -1,0 +1,696 @@
+// Copyright 2026 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Port of beatmapper's onset timbre shapes (src/onset_shape.cpp): every onset
+// in a track gets a short spread-spectrum descriptor (log-spaced bands over a
+// few sub-frames, level-normalised, relative to the stretch just before it),
+// the descriptors are clustered by k-means++ into a small vocabulary of
+// "shapes", and every onset is labelled with its nearest shape.  Onsets come
+// from a spectral-flux picker (compute_flux + find_onsets from
+// src/beat_spectral_flux.cpp), harvested in 20 s chunks.
+//
+// Input is a deterministic synthetic song (kick on beats 0,2; snare on 1,3;
+// hats on eighths); the check is that kick, snare and hat onsets land in
+// distinct shapes.  Args: <clip.wav> <song ms> <k> <profile ms> [t]; the clip
+// is tiled to the song length and a 5th argument prints a time breakdown.
+
+// Interleaved PCM audio (beatmapper's AudioPcm).
+class AudioPcm(pcm: Array<float>, frameCount: int, channels: int, sampleRate: int) { }
+
+// Shape parameters (shape_params_defaults).
+class ShapeParams {
+	var k = 5;
+	var windowFrac = 0.25f;
+	var slotsPerBeat = 12;
+	var bands = 24;
+	var frames = 3;
+	var lowWeight = 1.5f;
+	var highWeight = 1.5f;
+	var onsetThreshold = 1.0f;
+}
+
+class ShapeVocab {
+	var valid = false;
+	var k = 0;
+	var dim = 0;
+	var cent: Array<float>;
+	var mean: Array<float>;
+	var invStd: Array<float>;
+	var scale = 1.0f;
+	var count: Array<int>;
+	var energy: Array<float>;
+}
+
+def SHAPE_MAX_K = 8;
+def F_LO = 40.0;
+def F_HI = 12000.0;
+def PIF = 3.14159265f;
+
+// Iterative Cooley-Tukey radix-2 in-place FFT, as beatmapper's chroma_fft.h.
+// Its twiddles come from a complex recurrence in float that restarts for each
+// block of a stage, so every block of a stage sees the same sequence; it is
+// computed once per size here (same float operations, bit-identical results)
+// to keep the recurrence's serial chain out of the butterfly loop.
+class FftTwiddles(n: int) {
+	def wr = Array<float>.new(n);	// stage len uses [len/2 .. len)
+	def wi = Array<float>.new(n);
+	new() {
+		for (len = 2; len <= n; len <<= 1) {
+			var ang = -2.0f * 3.14159265358979f / float.!(len);
+			var swr = DspMath.cosf(ang), swi = DspMath.sinf(ang);
+			var cr = 1.0f, ci = 0.0f, h = len >> 1;
+			for (k < h) {
+				wr[h + k] = cr; wi[h + k] = ci;
+				var nr = cr * swr - ci * swi;
+				var ni = cr * swi + ci * swr;
+				cr = nr; ci = ni;
+			}
+		}
+	}
+}
+var twiddles = Array<FftTwiddles>.new(16);
+def chromaFft(re: Array<float>, im: Array<float>, n: int) {
+	var lg = 0;
+	while ((1 << byte.!(lg)) < n) lg++;
+	var tw = twiddles[lg];
+	if (tw == null) tw = twiddles[lg] = FftTwiddles.new(n);
+	var twr = tw.wr, twi = tw.wi;
+	// Bit-reversal permutation
+	var j = 0;
+	for (i = 1; i < n; i++) {
+		var bit = n >> 1;
+		while ((j & bit) != 0) { j ^= bit; bit >>= 1; }
+		j ^= bit;
+		if (i < j) {
+			var t = re[i]; re[i] = re[j]; re[j] = t;
+			t = im[i]; im[i] = im[j]; im[j] = t;
+		}
+	}
+	// Butterfly stages
+	for (len = 2; len <= n; len <<= 1) {
+		var h = len >> 1;
+		for (i = 0; i < n; i += len) {
+			for (k < h) {
+				var cr = twr[h + k], ci = twi[h + k];
+				var a = i + k, b = a + h;
+				var ur = re[a], ui = im[a];
+				var vr = re[b] * cr - im[b] * ci;
+				var vi = re[b] * ci + im[b] * cr;
+				re[a] = ur + vr; im[a] = ui + vi;
+				re[b] = ur - vr; im[b] = ui - vi;
+			}
+		}
+	}
+}
+
+//==========================================================================
+// Spectral-flux onset picker (beat_spectral_flux.cpp: compute_flux, find_onsets)
+//==========================================================================
+def BF_FFT = 2048;
+def BF_HOP = 512;
+def BF_BINS = BF_FFT / 2;
+def MAX_BEAT_CANDS = 2048;
+
+def computeFlux(a: AudioPcm, t_start: double, t_end: double) -> Array<float> {
+	var sr = a.sampleRate, channels = a.channels, pcm = a.pcm;
+	var total = long.!(a.frameCount);
+	var s0 = long.truncd(t_start * sr);
+	var s1 = long.truncd(t_end * sr);
+	if (s1 > total) s1 = total;
+	if (s0 >= s1 || s1 - s0 < BF_FFT) return null;
+	var n = int.!((s1 - s0 - BF_FFT) / BF_HOP) + 1;
+	if (n <= 0) return null;
+
+	var flux = Array<float>.new(n);
+	var re = Array<float>.new(BF_FFT), im = Array<float>.new(BF_FFT);
+	var prev = Array<float>.new(BF_BINS);
+	var window = Array<float>.new(BF_FFT);
+	for (i < BF_FFT) window[i] = 0.5f * (1.0f - DspMath.cosf(2.0f * PIF * float.!(i) / float.!(BF_FFT - 1)));
+	var chf = float.!(channels);
+
+	for (f < n) {
+		var off = int.!(s0) + f * BF_HOP;
+		for (i < BF_FFT) {
+			var fi = off + i;
+			var s = 0.0f;
+			if (fi < total) {
+				for (ch < channels) s += pcm[fi * channels + ch];
+				s /= chf;
+			}
+			re[i] = s * window[i];
+			im[i] = 0.0f;
+		}
+		chromaFft(re, im, BF_FFT);
+		var sf = 0.0f;
+		for (b < BF_BINS) {
+			var mag = float.sqrt(re[b] * re[b] + im[b] * im[b]);
+			var diff = mag - prev[b];
+			if (diff > 0.0f) sf += diff;
+			prev[b] = mag;
+		}
+		flux[f] = sf;
+	}
+	// Normalise the ODF to unit standard deviation
+	var mean = 0.0;
+	for (i < n) mean += flux[i];
+	mean /= n;
+	var vr = 0.0;
+	for (i < n) { var d = flux[i] - mean; vr += d * d; }
+	var inv = if(vr > 1e-12, float.roundd(1.0 / double.sqrt(vr / n)), 1.0f);
+	for (i < n) flux[i] *= inv;
+	return flux;
+}
+
+// Local maxima above mean + mult * std, at least ~50 ms apart.
+def findOnsets(flux: Array<float>, t_start: double, sample_rate: int, threshold_mult: float,
+		times: Array<double>, max_count: int) -> int {
+	var n = flux.length, count = 0;
+	if (n < 3) return 0;
+	var sum = 0.0f, sum2 = 0.0f;
+	for (i < n) { sum += flux[i]; sum2 += flux[i] * flux[i]; }
+	var fn = float.!(n);
+	var mean = sum / fn;
+	var vr = sum2 / fn - mean * mean;
+	var std = if(vr > 0.0f, float.sqrt(vr), 1e-9f);
+	var thr = mean + threshold_mult * std;
+
+	var hop_sec = double.!(BF_HOP) / sample_rate;
+	var min_gap = int.truncd(0.05 / hop_sec);
+	if (min_gap < 1) min_gap = 1;
+	var last = -min_gap * 2;
+	for (i = 1; i < n - 1 && count < max_count; i++) {
+		if (flux[i] > thr && flux[i] > flux[i - 1] && flux[i] >= flux[i + 1] && (i - last) >= min_gap) {
+			times[count++] = t_start + double.!(i) * hop_sec;
+			last = i;
+		}
+	}
+	return count;
+}
+
+// Onsets over the whole track, in chunks (harvest_onsets).
+def harvestOnsets(a: AudioPcm, duration: double, threshold: float) -> Array<double> {
+	var CHUNK = 20.0, PAD = 0.5;
+	var out = Vector<double>.new();
+	var times = Array<double>.new(MAX_BEAT_CANDS);
+	for (t0 = 0.0; t0 < duration; t0 += CHUNK) {
+		var t1 = DspMath.dmin(duration, t0 + CHUNK + PAD);
+		if (t1 - t0 < 0.3) break;
+		var flux = computeFlux(a, t0, t1);
+		var count = 0;
+		if (flux != null && flux.length >= 4) count = findOnsets(flux, t0, a.sampleRate, threshold, times, MAX_BEAT_CANDS);
+		for (i < count) {
+			var t = times[i];
+			if (t >= t0 + CHUNK) continue;
+			if (out.length > 0 && t - out.get(out.length - 1) < 0.02) continue;
+			out.put(t);
+		}
+	}
+	var r = out.extract();
+	// sort (insertion: already nearly sorted)
+	for (i = 1; i < r.length; i++) {
+		var v = r[i], j = i - 1;
+		while (j >= 0 && r[j] > v) { r[j + 1] = r[j]; j--; }
+		r[j + 1] = v;
+	}
+	return r;
+}
+
+//==========================================================================
+// Descriptor
+//==========================================================================
+
+// Log-band energies of one frame starting at sample fs (flen samples, Hann,
+// zero-padded to nfft).  Returns the frame's mean square for loudness.
+def bandFrame(a: AudioPcm, fs: int, flen: int, nfft: int, edge: Array<int>, bands: int,
+		re: Array<float>, im: Array<float>, out: Array<float>, outOff: int) -> double {
+	var ms = 0.0, n = 0;
+	var pcm = a.pcm, ch = a.channels, chf = float.!(a.channels);
+	var wden = float.!(if(flen > 1, flen - 1, 1));
+	for (i < nfft) {
+		var v = 0.0f;
+		var idx = fs + i;
+		if (i < flen && idx >= 0 && idx < a.frameCount) {
+			for (c < ch) v += pcm[idx * ch + c];
+			v /= chf;
+			ms += double.!(v) * v; n++;
+		}
+		var w = if(i < flen, 0.5f * (1.0f - DspMath.cosf(2.0f * PIF * float.!(i) / wden)), 0.0f);
+		re[i] = v * w; im[i] = 0.0f;
+	}
+	chromaFft(re, im, nfft);
+	for (b < bands) {
+		var e = 0.0;
+		for (k = edge[b]; k < edge[b + 1]; k++) e += double.!(re[k]) * re[k] + double.!(im[k]) * im[k];
+		e /= (edge[b + 1] - edge[b]);
+		out[outOff + b] = DspMath.log10f(1.0f + float.roundd(e) * 1e4f);
+	}
+	return if(n > 0, ms / n, 0.0);
+}
+
+def bandEdges(bands: int, nfft: int, sr: int) -> Array<int> {
+	var edge = Array<int>.new(bands + 1);
+	for (b = 0; b <= bands; b++) {
+		var f = F_LO * DspMath.pow(F_HI / F_LO, double.!(b) / bands);
+		var bin = int.truncd(f * nfft / sr);
+		if (bin < 1) bin = 1;
+		if (bin > nfft / 2) bin = nfft / 2;
+		edge[b] = bin;
+	}
+	for (b = 1; b <= bands; b++) if (edge[b] <= edge[b - 1]) edge[b] = edge[b - 1] + 1;
+	return edge;
+}
+
+// Spectral shape of [t0, t1): mean log-band energy with the band mean removed.
+def shapeBandProfile(a: AudioPcm, t0: double, t1: double, bands: int) -> Array<float> {
+	bands = if(bands < 4, 4, if(bands > 64, 64, bands));
+	var out = Array<float>.new(bands);
+	if (t1 <= t0 || a.sampleRate == 0) return out;
+	var nfft = 2048, flen = 2048, hop = 1024;
+	var s0 = int.truncd(t0 * a.sampleRate), s1 = int.truncd(t1 * a.sampleRate);
+	if (s1 - s0 < flen / 2) s1 = s0 + flen / 2;
+	var re = Array<float>.new(nfft), im = Array<float>.new(nfft), tmp = Array<float>.new(bands);
+	var edge = bandEdges(bands, nfft, a.sampleRate);
+	var n = 0;
+	for (fs = s0; fs + flen / 2 <= s1 && n < 32; fs += hop) {
+		bandFrame(a, fs, flen, nfft, edge, bands, re, im, tmp, 0);
+		for (b < bands) out[b] += tmp[b];
+		n++;
+	}
+	if (n == 0) return out;
+	var mean = 0.0f, fn = float.!(n), fb = float.!(bands);
+	for (b < bands) { out[b] /= fn; mean += out[b] / fb; }
+	for (b < bands) out[b] -= mean;
+	return out;
+}
+
+// Descriptor of the audio in [t, t + win]; returns the window's RMS energy in dB.
+def shapeDescriptor(a: AudioPcm, t: double, win: double, p: ShapeParams, out: Array<float>, outOff: int) -> float {
+	var bands = if(p.bands < 4, 4, if(p.bands > 64, 64, p.bands));
+	var frames = if(p.frames < 1, 1, if(p.frames > 8, 8, p.frames));
+	var dim = bands * frames;
+	for (i < dim) out[outOff + i] = 0.0f;
+	if (win <= 0.0 || a.sampleRate == 0) return -120.0f;
+
+	var s0 = int.truncd(t * a.sampleRate);
+	var wlen = int.truncd(win * a.sampleRate);
+	if (wlen < 64) wlen = 64;
+	var flen = wlen / frames;
+	var nfft = 256;
+	while (nfft < flen) nfft <<= 1;
+	if (nfft > 8192) nfft = 8192;
+
+	var re = Array<float>.new(nfft), im = Array<float>.new(nfft);
+	var edge = bandEdges(bands, nfft, a.sampleRate);
+
+	// Reference: the same-length stretch just before the onset.
+	var ref = Array<float>.new(bands), tmp = Array<float>.new(bands);
+	var ff = float.!(frames);
+	for (f < frames) {
+		bandFrame(a, s0 - wlen + f * flen, flen, nfft, edge, bands, re, im, tmp, 0);
+		for (b < bands) ref[b] += tmp[b] / ff;
+	}
+	var ms = 0.0;
+	for (f < frames) {
+		ms += bandFrame(a, s0 + f * flen, flen, nfft, edge, bands, re, im, out, outOff + f * bands);
+		for (b < bands) {
+			var i = outOff + f * bands + b;
+			var d = out[i] - ref[b];
+			out[i] = if(d > 0.0f, d, 0.0f);	// only what appeared
+		}
+	}
+	var energy = 10.0f * DspMath.log10f(float.roundd(ms / frames) + 1e-12f);
+
+	// Emphasise the ends of the spectrum, then unit length
+	for (f < frames) {
+		for (b < bands) {
+			var fc = F_LO * DspMath.pow(F_HI / F_LO, (b + 0.5) / bands);
+			var w = 1.0f;
+			if (fc < 200.0) w = p.lowWeight;
+			if (fc > 4000.0) w = p.highWeight;
+			out[outOff + f * bands + b] *= w;
+		}
+	}
+	var n2 = 0.0f;
+	for (i < dim) { var v = out[outOff + i]; n2 += v * v; }
+	if (n2 > 1e-12f) {
+		var inv = 1.0f / float.sqrt(n2);
+		for (i < dim) out[outOff + i] *= inv;
+	}
+	return energy;
+}
+
+//==========================================================================
+// Vocabulary
+//==========================================================================
+def dist2(a: Array<float>, ao: int, b: Array<float>, bo: int, dim: int) -> float {
+	var d = 0.0f;
+	for (i < dim) { var x = a[ao + i] - b[bo + i]; d += x * x; }
+	return d;
+}
+
+// Deterministic LCG so repeated runs give the same vocabulary.
+var s_rng = 12345u;
+def rngNext() -> u32 { s_rng = s_rng * 1664525u + 1013904223u; return s_rng; }
+def rngUnit() -> float { return float.roundd(rngNext() >> 8) / 16777216.0f; }
+
+def copyRow(dst: Array<float>, doff: int, src: Array<float>, soff: int, dim: int) {
+	for (d < dim) dst[doff + d] = src[soff + d];
+}
+
+// K-means++ over n descriptors (feats is n*dim, row-major).
+def shapeTrain(feats_raw: Array<float>, energies: Array<float>, n: int, dim: int, k: int, out: ShapeVocab) -> bool {
+	if (k < 1) k = 1;
+	if (k > SHAPE_MAX_K) k = SHAPE_MAX_K;
+	out.valid = false;
+	if (n < k || dim < 1) return false;
+
+	// Standardise each dimension across the training set.
+	var mean = Array<float>.new(dim), inv_std = Array<float>.new(dim);
+	for (d < dim) inv_std[d] = 1.0f;
+	var fn = float.!(n);
+	for (i < n) for (d < dim) mean[d] += feats_raw[i * dim + d];
+	for (d < dim) mean[d] /= fn;
+	for (i < n) for (d < dim) { var x = feats_raw[i * dim + d] - mean[d]; inv_std[d] += x * x; }
+	for (d < dim) { var v = (inv_std[d] - 1.0f) / fn; inv_std[d] = if(v > 1e-8f, 1.0f / float.sqrt(v), 0.0f); }
+	var feats = Array<float>.new(n * dim);
+	for (i < n) for (d < dim) feats[i * dim + d] = (feats_raw[i * dim + d] - mean[d]) * inv_std[d];
+
+	var best_cent: Array<float>;
+	var best_assign: Array<int>;
+	var best_sse = 1e30f;
+	s_rng = 12345u;
+
+	for (restart < 3) {
+		var cent = Array<float>.new(k * dim);
+		var dmin = Array<float>.new(n);
+		for (i < n) dmin[i] = 1e30f;
+		// k-means++ seeding
+		var first = int.truncf(rngUnit() * fn) % n;
+		copyRow(cent, 0, feats, first * dim, dim);
+		for (c = 1; c < k; c++) {
+			var total = 0.0;
+			for (i < n) {
+				var d = dist2(feats, i * dim, cent, (c - 1) * dim, dim);
+				if (d < dmin[i]) dmin[i] = d;
+				total += dmin[i];
+			}
+			var r = rngUnit() * total, acc = 0.0;
+			var pick = n - 1;
+			for (i < n) { acc += dmin[i]; if (acc >= r) { pick = i; break; } }
+			copyRow(cent, c * dim, feats, pick * dim, dim);
+		}
+		var assign = Array<int>.new(n);
+		var sum = Array<float>.new(k * dim);
+		var cnt = Array<int>.new(k);
+		for (iter < 40) {
+			var changed = false;
+			for (i < n) {
+				var bc = 0, bd = 1e30f;
+				for (c < k) {
+					var d = dist2(feats, i * dim, cent, c * dim, dim);
+					if (d < bd) { bd = d; bc = c; }
+				}
+				if (assign[i] != bc) { assign[i] = bc; changed = true; }
+			}
+			for (i < sum.length) sum[i] = 0.0f;
+			for (c < k) cnt[c] = 0;
+			for (i < n) {
+				var a = assign[i];
+				cnt[a]++;
+				for (d < dim) sum[a * dim + d] += feats[i * dim + d];
+			}
+			for (c < k) {
+				if (cnt[c] == 0) {	// empty cluster: re-seed on the farthest point
+					var far = 0, fd = -1.0f;
+					for (i < n) {
+						var d = dist2(feats, i * dim, cent, assign[i] * dim, dim);
+						if (d > fd) { fd = d; far = i; }
+					}
+					copyRow(cent, c * dim, feats, far * dim, dim);
+					changed = true;
+					continue;
+				}
+				var fc = float.!(cnt[c]);
+				for (d < dim) cent[c * dim + d] = sum[c * dim + d] / fc;
+			}
+			if (!changed) break;
+		}
+		var sse = 0.0f;
+		for (i < n) sse += dist2(feats, i * dim, cent, assign[i] * dim, dim);
+		if (sse < best_sse) { best_sse = sse; best_cent = cent; best_assign = assign; }
+	}
+
+	// Order shapes loudest first
+	var en = Array<float>.new(k);
+	var cnt = Array<int>.new(k);
+	for (i < n) { en[best_assign[i]] += if(energies != null, energies[i], 0.0f); cnt[best_assign[i]]++; }
+	for (c < k) en[c] = if(cnt[c] > 0, en[c] / float.!(cnt[c]), -120.0f);
+	var order = Array<int>.new(k);
+	for (c < k) order[c] = c;
+	for (i = 1; i < k; i++) {	// stable insertion sort, descending energy
+		var v = order[i], j = i - 1;
+		while (j >= 0 && en[order[j]] < en[v]) { order[j + 1] = order[j]; j--; }
+		order[j + 1] = v;
+	}
+
+	out.k = k; out.dim = dim;
+	out.mean = mean; out.invStd = inv_std;
+	// Membership sharpness: one "typical" nearest-centroid distance
+	var acc = 0.0;
+	for (i < n) acc += dist2(feats, i * dim, best_cent, best_assign[i] * dim, dim);
+	out.scale = if(float.roundd(acc / n) > 1e-6f, float.roundd(n / acc), 1.0f);
+	out.cent = Array<float>.new(k * dim);
+	out.count = Array<int>.new(k);
+	out.energy = Array<float>.new(k);
+	for (c < k) {
+		copyRow(out.cent, c * dim, best_cent, order[c] * dim, dim);
+		out.count[c] = cnt[order[c]];
+		out.energy[c] = en[order[c]];
+	}
+	out.valid = true;
+	return true;
+}
+
+// Nearest shape, and a soft membership (sums to 1) when soft is non-null.
+def zbuf = Array<float>.new(256);
+def dbuf = Array<float>.new(SHAPE_MAX_K);
+def shapeClassify(v: ShapeVocab, feat: Array<float>, foff: int, soft: Array<float>) -> int {
+	if (!v.valid) {
+		if (soft != null) for (c < SHAPE_MAX_K) soft[c] = 0.0f;
+		return -1;
+	}
+	var z = zbuf, d = dbuf;
+	var dim = if(v.dim > 256, 256, v.dim);
+	for (i < dim) z[i] = (feat[foff + i] - v.mean[i]) * v.invStd[i];
+	var best = 0, bd = 1e30f;
+	for (c < v.k) {
+		d[c] = dist2(z, 0, v.cent, c * v.dim, dim);
+		if (d[c] < bd) { bd = d[c]; best = c; }
+	}
+	if (soft != null) {
+		var sum = 0.0f;
+		for (c < v.k) { soft[c] = DspMath.expf(-(d[c] - bd) * v.scale); sum += soft[c]; }
+		for (c < v.k) soft[c] /= sum;
+		for (c = v.k; c < SHAPE_MAX_K; c++) soft[c] = 0.0f;
+	}
+	return best;
+}
+
+//==========================================================================
+// Track-wide analysis (shape_analysis_ensure) and benchmark driver
+//==========================================================================
+def CLASS_NAMES = ["kick", "snare", "hat", "other"];
+
+def main(args: Array<string>) -> int {
+	// args: <clip.wav> <milliseconds of song> <vocabulary size k>
+	//       <band-profile window in milliseconds> [t: print timing]
+	if (args.length < 4) {
+		System.puts("Usage: OnsetShape <clip.wav> <milliseconds> <k> <profile-ms> [t]\n");
+		return 1;
+	}
+	var millis = Int.parse(args[1]);
+	var T0 = System.ticksUs();
+	var song = SynthSong.new();
+	song.seconds = double.!(millis) / 1000.0;
+	song.beatsPerChord = 1;	// the clip's parameters (inputs/songs.list)
+	song.loadTiled(args[0]);
+	var T1 = System.ticksUs();
+	var a = AudioPcm.new(song.pcm, song.frames, song.channels, song.sampleRate);
+	var duration = double.!(song.frames) / song.sampleRate;
+	var p = ShapeParams.new();
+	// The synthetic hats are quiet next to kick and snare: at the default
+	// threshold (1.0) the picker only finds the beats, so lower it to harvest
+	// the eighth-note hats as well.
+	p.onsetThreshold = 0.1f;
+	p.k = Int.parse(args[2]);
+	var beats = song.beatTimes;
+
+	// Window: a fraction of the median beat
+	var med = 0.5;
+	if (beats.length >= 2) {
+		var d = Array<double>.new(beats.length - 1);
+		for (i = 1; i < beats.length; i++) d[i - 1] = beats[i] - beats[i - 1];
+		for (i = 1; i < d.length; i++) {
+			var v = d[i], j = i - 1;
+			while (j >= 0 && d[j] > v) { d[j + 1] = d[j]; j--; }
+			d[j + 1] = v;
+		}
+		med = d[d.length / 2];
+	}
+	var win = p.windowFrac * med;
+	if (win < 0.02) win = 0.02;
+
+	var onsets = harvestOnsets(a, duration, p.onsetThreshold);
+	var n = onsets.length;
+	var Ta = System.ticksUs();
+	var dim = DspMath.imin(64, DspMath.imax(4, p.bands)) * DspMath.imin(8, DspMath.imax(1, p.frames));
+	var feat = Array<float>.new(n * dim);
+	var energy = Array<float>.new(n);
+	for (i < n) energy[i] = shapeDescriptor(a, onsets[i], win, p, feat, i * dim);
+
+	var Tb = System.ticksUs();
+	// Training set: onsets inside mapped stretches, else every onset.
+	var tf = Vector<float>.new(), te = Vector<float>.new();
+	if (beats.length >= 2) {
+		var gap_thresh = 1.8 * med;
+		for (i < n) {
+			var t = onsets[i];
+			var j = 0;
+			while (j < beats.length && beats[j] < t) j++;	// lower_bound
+			var inside = j > 0 && j < beats.length && beats[j] - beats[j - 1] <= gap_thresh;
+			if (!inside) continue;
+			for (d < dim) tf.put(feat[i * dim + d]);
+			te.put(energy[i]);
+		}
+	}
+	var trainF: Array<float>, trainE: Array<float>;
+	if (te.length < p.k * 4) { trainF = feat; trainE = energy; }
+	else { trainF = tf.extract(); trainE = te.extract(); }
+	var vocab = ShapeVocab.new();
+	shapeTrain(trainF, trainE, trainE.length, dim, p.k, vocab);
+
+	var shape = Array<int>.new(n);
+	var softAll = Array<float>.new(n * SHAPE_MAX_K);
+	var soft = Array<float>.new(SHAPE_MAX_K);
+	var confSum = 0.0;
+	for (i < n) {
+		shape[i] = shapeClassify(vocab, feat, i * dim, soft);
+		for (c < SHAPE_MAX_K) softAll[i * SHAPE_MAX_K + c] = soft[c];
+		if (shape[i] >= 0) confSum += soft[shape[i]];
+	}
+
+	var Tc = System.ticksUs();
+	// A band profile of the start of the song, as the section-timbre tools use it.
+	var prof = shapeBandProfile(a, 0.0, DspMath.dmin(duration, double.!(Int.parse(args[3])) / 1000.0), p.bands);
+
+	var T2 = System.ticksUs();
+	if (args.length > 4) {
+		System.puts("time(us): load="); System.puti(T1 - T0);
+		System.puts(" onsets="); System.puti(Ta - T1);
+		System.puts(" descriptors="); System.puti(Tb - Ta);
+		System.puts(" train+classify="); System.puti(Tc - Tb);
+		System.puts(" profile="); System.puti(T2 - Tc);
+		System.ln();
+	}
+	// --- Report ---
+	DspOut.label("onsets"); System.puti(n); System.ln();
+	DspOut.label("window"); DspOut.putd(win, 4); System.ln();
+	DspOut.label("dim"); System.puti(dim); System.ln();
+	DspOut.label("trained on"); System.puti(trainE.length); System.ln();
+	DspOut.label("scale"); DspOut.putf(vocab.scale, 3); System.ln();
+	for (c < vocab.k) {
+		System.puts("shape "); System.puti(c);
+		System.puts(": count="); System.puti(vocab.count[c]);
+		System.puts(" energy="); DspOut.putf(vocab.energy[c], 2);
+		System.puts(" cent="); System.puti(DspOut.checksum(vocab.cent, c * dim, dim));
+		System.ln();
+	}
+	DspOut.label("mean conf"); DspOut.putd(if(n > 0, confSum / n, 0.0), 3); System.ln();
+	var tsum = 0.0, fsum = 0.0, psum = 0.0;
+	for (i < n) tsum += onsets[i];
+	for (v in feat) fsum += v;
+	for (v in prof) psum += double.abs(v);
+	DspOut.label("onset time sum"); DspOut.putd(tsum, 4); System.ln();
+	DspOut.label("feature sum"); DspOut.putd(fsum, 3); System.ln();
+	DspOut.label("profile abs sum"); DspOut.putd(psum, 4); System.ln();
+	DspOut.label("profile"); System.puti(DspOut.checksum(prof, 0, prof.length)); System.ln();
+	DspOut.label("features"); System.puti(DspOut.checksum(feat, 0, feat.length)); System.ln();
+	DspOut.label("soft"); System.puti(DspOut.checksum(softAll, 0, softAll.length)); System.ln();
+	System.puts("labels: ");
+	for (i < DspMath.imin(n, 48)) System.putc(byte.!('0' + shape[i]));
+	System.ln();
+	var h = 0;
+	for (i < n) h = h * 31 + shape[i];
+	DspOut.label("label hash"); System.puti(h); System.ln();
+
+	// --- Ground truth: kick / snare / hat by nearest eighth-note slot ---
+	// The flux picker reports the start of the first FFT frame that sees the
+	// hit, so compare against hit time minus up to one frame.
+	var half = med / 2;
+	var nslots = int.truncd(duration / half) + 1;
+	var slotHit = Array<bool>.new(nslots);
+	var cls = Array<int>.new(n);
+	var conf = Array<Array<int>>.new(4);
+	for (c < 4) conf[c] = Array<int>.new(SHAPE_MAX_K);
+	for (i < n) {
+		var t = onsets[i] + double.!(BF_FFT) / a.sampleRate * 0.5;
+		var k = int.truncd(double.round(t / half));
+		var c = 3;
+		if (double.abs(t - k * half) < 0.06) {
+			var beat = k / 2;
+			if ((k % 2) == 1) c = 2;
+			else if ((beat % 2) == 0) c = 0;
+			else c = 1;
+			if (k < nslots) slotHit[k] = true;
+		}
+		cls[i] = c;
+		if (shape[i] >= 0) conf[c][shape[i]]++;
+	}
+	var major = Array<int>.new(3);
+	for (c < 4) {
+		System.puts(CLASS_NAMES[c]); System.puts(":");
+		var best = 0;
+		for (s < vocab.k) {
+			System.putc(' '); System.puti(conf[c][s]);
+			if (conf[c][s] > conf[c][best]) best = s;
+		}
+		System.ln();
+		if (c < 3) major[c] = best;
+	}
+	System.puts("majority shapes: kick="); System.puti(major[0]);
+	System.puts(" snare="); System.puti(major[1]);
+	System.puts(" hat="); System.puti(major[2]);
+	System.ln();
+
+	// Checks.  Recall: eighth-note hits (after the first, which no frame
+	// can precede) that have a detected onset.
+	var expected = 0, hit = 0;
+	for (k = 1; k < nslots; k++) {
+		if (k * half + 0.06 >= duration) break;
+		expected++;
+		if (slotHit[k]) hit++;
+	}
+	// Purity: onsets whose shape's majority class is their own class.
+	var pure = 0;
+	for (i < n) {
+		if (shape[i] < 0) continue;
+		var bc = 0;
+		for (c < 4) if (conf[c][shape[i]] > conf[bc][shape[i]]) bc = c;
+		if (bc == cls[i]) pure++;
+	}
+	var ok = true;
+	ok &= check("onset recall >= 90% of drum hits", hit, expected, 90);
+	ok &= check("shape purity >= 85% of onsets", pure, n, 85);
+	var distinct = vocab.valid && major[0] != major[1] && major[0] != major[2] && major[1] != major[2];
+	System.puts("check kick/snare/hat in distinct shapes: ");
+	System.puts(if(distinct, "PASS\n", "FAIL\n"));
+	ok &= distinct;
+	return if(ok, 0, 1);
+}
+def check(what: string, num: int, den: int, pct: int) -> bool {
+	var pass = den > 0 && num * 100 >= pct * den;
+	System.puts("check "); System.puts(what); System.puts(" ("); System.puti(num);
+	System.puts("/"); System.puti(den); System.puts("): ");
+	System.puts(if(pass, "PASS\n", "FAIL\n"));
+	return pass;
+}

@@ -1,0 +1,27 @@
+onsets: 79
+window: 0.1250
+dim: 72
+trained on: 78
+scale: 0.060
+shape 0: count=19 energy=-13.65 cent=358937694
+shape 1: count=1 energy=-16.14 cent=-1575546728
+shape 2: count=9 energy=-16.34 cent=867240683
+shape 3: count=10 energy=-16.67 cent=-1480287730
+shape 4: count=39 energy=-18.15 cent=1270936680
+mean conf: 0.996
+onset time sum: 785.9026
+feature sum: 286.547
+profile abs sum: 36.3319
+profile: -894356461
+features: 1425834654
+soft: 1946940878
+labels: 434042404340424043404240434042404340424043404240
+label hash: -2027128433
+kick: 19 0 0 0 0
+snare: 0 1 9 10 0
+hat: 0 0 0 0 40
+other: 0 0 0 0 0
+majority shapes: kick=0 snare=3 hat=4
+check onset recall >= 90% of drum hits (79/79): PASS
+check shape purity >= 85% of onsets (79/79): PASS
+check kick/snare/hat in distinct shapes: PASS

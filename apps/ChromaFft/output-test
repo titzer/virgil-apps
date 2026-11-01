@@ -1,0 +1,25 @@
+0 C: C/C C/C C/C
+1 C: C/C C/C C/C
+2 C: C/C C/C C/C
+3 C: C/C C/C C/C
+4 Am: A/Am A/F A/Am
+5 Am: A/Am A/F A/Am
+6 Am: A/A A/F A/Am
+7 Am: A/Am A/F A/Am
+8 F: F/F F/C# F/F
+9 F: F/C# F/C# F/C#
+10 F: F/C# F/C# F/C#
+11 F: F/C# F/C# F/C#
+12 G: G/G G/C G/G
+13 G: G/G G/C G/G
+14 G: G/G G/C G/G
+15 G: G/G G/C G/G
+hps: root 16/16 triad 12/16 cos 0.688 checksum 745569238
+peaks: root 16/16 triad 4/16 cos 0.637 checksum -826071578
+hps_peaks: root 16/16 triad 13/16 cos 0.685 checksum -564914593
+check hps root accuracy >= 95%: PASS (16/16)
+check hps triad accuracy >= 60%: PASS (12/16)
+check peaks root accuracy >= 95%: PASS (16/16)
+check peaks triad accuracy >= 20%: PASS (4/16)
+check hps_peaks root accuracy >= 95%: PASS (16/16)
+check hps_peaks triad accuracy >= 60%: PASS (13/16)

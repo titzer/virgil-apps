@@ -1,0 +1,121 @@
+// Copyright 2026 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Beat-synchronous NNLS chroma (beatmapper chroma_nnls.cpp) over a synthetic song.
+//   1. Map FFT power to a 60-bin log-frequency spectrum (C2=0 .. B6=59).
+//   2. Template matrix A (60x12): each pitch class over octaves 2..6 and
+//      harmonics 1..10 with exponentially decaying weights.
+//   3. Solve x = argmin_{x>=0} ||A x - b||^2 with Lee-Seung multiplicative updates.
+//   4. Normalise x to [0,1] with a dB floor.
+def NNLS_N = 8192;	// FFT window size
+def LOG_BINS = 60;	// C2..B6 (5 octaves x 12 semitones)
+def N_PC = 12;		// pitch classes
+def NNLS_ITERS = 80;	// multiplicative update iterations
+def F_C2 = 65.406f;	// C2 = MIDI 36
+
+component ChromaNnls {
+	def A = buildTemplates();	// [k * N_PC + pc]
+	def AtA = buildGram();		// [j * N_PC + k]
+	def win = Chroma.hann(NNLS_N);
+	def re = Array<float>.new(NNLS_N);
+	def im = Array<float>.new(NNLS_N);
+	def logspec = Array<double>.new(LOG_BINS);
+	def bVec = Array<float>.new(LOG_BINS);
+	def Atb = Array<float>.new(N_PC);
+	def AtAx = Array<float>.new(N_PC);
+	def x = Array<float>.new(N_PC);
+
+	// Nearest log-frequency bin (0=C2 .. 59=B6), or -1 if out of range.
+	def freqToLogbin(f: float) -> int {
+		if (f <= 0.0f) return -1;
+		var semi = 12.0f * Chroma.log2f(f / F_C2);
+		var k = Chroma.roundf(semi);
+		return if(k >= 0 && k < LOG_BINS, k, -1);
+	}
+	def buildTemplates() -> Array<float> {
+		var A = Array<float>.new(LOG_BINS * N_PC);
+		var ROLLOFF = 0.65f;	// amplitude decay per harmonic
+		for (pc < N_PC) {
+			for (oct = 2; oct <= 6; oct++) {
+				var midi = 12 * (oct + 1) + pc;
+				var fund = 440.0f * DspMath.powf(2.0f, float.roundi(midi - 69) / 12.0f);
+				var w = 1.0f;
+				for (h = 1; h <= 10; h++) {
+					var k = freqToLogbin(float.roundi(h) * fund);
+					if (k >= 0) A[k * N_PC + pc] += w;
+					w *= ROLLOFF;
+				}
+			}
+		}
+		return A;
+	}
+	def buildGram() -> Array<float> {
+		var G = Array<float>.new(N_PC * N_PC);
+		for (j < N_PC) {
+			for (k < N_PC) {
+				var v = 0.0f;
+				for (r < LOG_BINS) v += A[r * N_PC + j] * A[r * N_PC + k];
+				G[j * N_PC + k] = v;
+			}
+		}
+		return G;
+	}
+	def run(pcm: Array<float>, frameCount: int, ch: int, sr: int, t0: double, t1: double, result: Array<float>) {
+		Chroma.zero(result);
+		if (pcm == null || frameCount == 0 || ch == 0 || sr == 0) return;
+		if (t1 - t0 > 8.0) t0 = t1 - 8.0;
+		var r = Chroma.range(t0, t1, sr, frameCount), fs = r.0, fe = r.1;
+		if (fe - fs < NNLS_N) return;
+
+		// Accumulate log-frequency power spectrum across all frames
+		for (k < LOG_BINS) logspec[k] = 0;
+		var freqPerBin = float.roundi(sr) / float.roundi(NNLS_N);
+		var numFrames = 0;
+		for (pos = fs; pos + NNLS_N <= fe; pos += NNLS_N) {
+			Chroma.monoWin(pcm, ch, pos, win, re, im, NNLS_N);
+			Chroma.fft(re, im, NNLS_N);
+			for (b = 1; b < NNLS_N / 2; b++) {
+				var k = freqToLogbin(float.roundi(b) * freqPerBin);
+				if (k >= 0) logspec[k] += re[b] * re[b] + im[b] * im[b];
+			}
+			numFrames++;
+		}
+		if (numFrames == 0) return;
+
+		// Average to get the observation vector b
+		for (k < LOG_BINS) bVec[k] = float.roundd(logspec[k] / numFrames);
+		// A^T b (the numerator in the update rule)
+		for (j < N_PC) {
+			var s = 0.0f;
+			for (k < LOG_BINS) s += A[k * N_PC + j] * bVec[k];
+			Atb[j] = s;
+		}
+		// Multiplicative update: x <- x .* (A^T b) ./ (A^T A x + eps)
+		for (j < N_PC) x[j] = Atb[j] + 1e-6f;
+		for (iter < NNLS_ITERS) {
+			for (j < N_PC) {
+				var s = 0.0f;
+				for (k < N_PC) s += AtA[j * N_PC + k] * x[k];
+				AtAx[j] = s;
+			}
+			for (j < N_PC) {
+				x[j] *= Atb[j] / (AtAx[j] + 1e-12f);
+				if (x[j] < 0.0f) x[j] = 0.0f;
+			}
+		}
+		// Normalise with dB floor
+		var mx = 1e-30f;
+		for (j < N_PC) if (x[j] > mx) mx = x[j];
+		for (j < N_PC) {
+			var db = 20.0f * DspMath.log10f(x[j] / mx + 1e-30f);
+			var v = (db + 30.0f) / 30.0f;
+			result[j] = if(v < 0.0f, 0.0f, if(v > 1.0f, 1.0f, v));
+		}
+	}
+}
+
+def main(args: Array<string>) -> int {
+	var song = ChromaBench.song(args, 440.0);
+	var ok = ChromaBench.run(song, [ChromaAlgo.new("nnls", ChromaNnls.run, 95, 95)]);
+	return if(ok, 0, 1);
+}

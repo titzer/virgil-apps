@@ -1,0 +1,306 @@
+// Copyright 2026 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Spectrogram benchmark: a port of beatmapper's spectrogram_compute_pixels()
+// (src/spectrogram.cpp): Hann-windowed STFT with a hand-rolled radix-2 FFT,
+// magnitude in dB mapped -80..0 dB -> [0,1], an inferno-like colormap to RGBA
+// bytes, plus a single-channel intensity image.  The GL upload/render half is
+// omitted.  Like beatmapper's stem view (stems.cpp), which builds one
+// spectrogram per stem, the benchmark renders a sequence of tracks (each up to
+// 20 s) cycling through three checked-in synthetic clips (inputs/Spectrogram-*.wav,
+// different tempo, key, tuning and seed), totalling the requested length (in ms).
+
+def FFT_N = 2048;		// FFT window size (must be power-of-two)
+def HOP = 512;			// hop size (75% overlap)
+def BINS = FFT_N / 2;		// 1024 bins, 0 Hz .. Nyquist
+def MAX_TEXW = 8192;		// max texture width (time columns)
+
+// Iterative Cooley-Tukey radix-2 FFT (in-place, decimation-in-time), with
+// per-stage twiddle recurrence, exactly as in spectrogram.cpp.
+def fft(re: Array<float>, im: Array<float>, n: int) {
+	// Bit-reversal permutation
+	var j = 0;
+	for (i = 1; i < n; i++) {
+		var bit = n >> 1;
+		while ((j & bit) != 0) { j ^= bit; bit >>= 1; }
+		j ^= bit;
+		if (i < j) {
+			var t = re[i]; re[i] = re[j]; re[j] = t;
+			t = im[i]; im[i] = im[j]; im[j] = t;
+		}
+	}
+	// Butterfly stages
+	for (len = 2; len <= n; len <<= 1) {
+		var ang = -2.0f * 3.14159265358979f / float.roundi(len);
+		var wr = DspMath.cosf(ang), wi = DspMath.sinf(ang);
+		var half = len >> 1;
+		for (i = 0; i < n; i += len) {
+			var cr = 1.0f, ci = 0.0f;
+			for (k < half) {
+				var a = i + k, b = a + half;
+				var ur = re[a], ui = im[a];
+				var vr = re[b] * cr - im[b] * ci;
+				var vi = re[b] * ci + im[b] * cr;
+				re[a] = ur + vr;
+				im[a] = ui + vi;
+				re[b] = ur - vr;
+				im[b] = ui - vi;
+				var nr = cr * wr - ci * wi;
+				var ni = cr * wi + ci * wr;
+				cr = nr; ci = ni;
+			}
+		}
+	}
+}
+
+// Colormap: intensity [0,1] -> RGB bytes.
+// Inferno-like: near-black -> dark-purple -> orange -> bright yellow-white.
+def STOP_T: Array<float> = [0.00f, 0.20f, 0.40f, 0.60f, 0.80f, 1.00f];
+def STOP_R = [  4,  30, 130, 220, 255, 255];
+def STOP_G = [  2,  12,  25,  80, 200, 255];
+def STOP_B = [ 10,  80, 120,  20,  30, 220];
+def NSTOPS = 6;
+
+// Writes r, g, b into {out} at {pos}.
+def colormap(v: float, out: Array<byte>, pos: int) {
+	if (v <= 0.0f) {
+		out[pos] = byte.view(STOP_R[0]); out[pos + 1] = byte.view(STOP_G[0]); out[pos + 2] = byte.view(STOP_B[0]);
+		return;
+	}
+	var L = NSTOPS - 1;
+	if (v >= 1.0f) {
+		out[pos] = byte.view(STOP_R[L]); out[pos + 1] = byte.view(STOP_G[L]); out[pos + 2] = byte.view(STOP_B[L]);
+		return;
+	}
+	for (i < L) {
+		if (v < STOP_T[i + 1]) {
+			var t = (v - STOP_T[i]) / (STOP_T[i + 1] - STOP_T[i]);
+			out[pos] = byte.view(STOP_R[i] + int.truncf(t * float.roundi(STOP_R[i + 1] - STOP_R[i])));
+			out[pos + 1] = byte.view(STOP_G[i] + int.truncf(t * float.roundi(STOP_G[i + 1] - STOP_G[i])));
+			out[pos + 2] = byte.view(STOP_B[i] + int.truncf(t * float.roundi(STOP_B[i + 1] - STOP_B[i])));
+			return;
+		}
+	}
+	out[pos] = byte.view(STOP_R[L]); out[pos + 1] = byte.view(STOP_G[L]); out[pos + 2] = byte.view(STOP_B[L]);
+}
+
+// CPU half of a spectrogram: the colour-mapped image and the raw intensity.
+class SpectrogramPixels {
+	var rgba: Array<byte>;		// texW * texH * 4, row 0 = Nyquist
+	var intensity: Array<byte>;	// texW * texH, same layout, 0..255 = -80..0 dB
+	var texW: int;
+	var texH: int;
+	var duration: double;
+	var sampleRate: int;
+}
+
+def computePixels(px: SpectrogramPixels, mono: Array<float>, numSamples: int, sampleRate: int) -> bool {
+	px.rgba = null; px.intensity = null; px.texW = 0; px.texH = 0;
+	if (mono == null || numSamples < FFT_N || sampleRate == 0) return false;
+
+	var numFrames = long.!(numSamples - FFT_N) / HOP + 1;
+	if (numFrames <= 0) return false;
+
+	var texW = int.!(if(numFrames < MAX_TEXW, numFrames, MAX_TEXW));
+	var texH = BINS;
+
+	// Hann window
+	var window = Array<float>.new(FFT_N);
+	for (i < FFT_N) {
+		window[i] = 0.5f * (1.0f - DspMath.cosf(2.0f * 3.14159265358979f * float.roundi(i) / float.roundi(FFT_N - 1)));
+	}
+
+	var pixels = Array<byte>.new(texW * texH * 4);
+	var inten = Array<byte>.new(texW * texH);
+	var re = Array<float>.new(FFT_N);
+	var im = Array<float>.new(FFT_N);
+
+	var invNorm = 1.0f / (float.roundi(FFT_N) * 0.5f);	// normalize so 0 dBFS sine ~ 1.0
+
+	for (col < texW) {
+		// Map texture column linearly to an STFT frame
+		var frame = if(texW > 1, long.!(col) * (numFrames - 1) / (texW - 1), 0L);
+		var offset = frame * HOP;
+
+		for (i < FFT_N) {
+			var idx = offset + i;
+			var samp = if(idx < numSamples, mono[int.!(idx)], 0.0f);
+			re[i] = samp * window[i];
+			im[i] = 0.0f;
+		}
+
+		fft(re, im, FFT_N);
+
+		for (bin < texH) {
+			var mag = float.sqrt(re[bin] * re[bin] + im[bin] * im[bin]) * invNorm;
+			var db = 20.0f * DspMath.log10f(mag + 1e-9f);
+
+			// Map -80 dB .. 0 dB -> [0, 1]
+			var v = (db + 80.0f) / 80.0f;
+			if (v < 0.0f) v = 0.0f;
+			if (v > 1.0f) v = 1.0f;
+
+			// bin 0 (DC / low freq) -> bottom row; bin BINS-1 (Nyquist) -> top row
+			var row = (texH - 1) - bin;
+			var pidx = (row * texW + col) * 4;
+			colormap(v, pixels, pidx);
+			pixels[pidx + 3] = 255;
+			inten[row * texW + col] = byte.view(int.truncf(v * 255.0f + 0.5f));
+		}
+	}
+
+	px.rgba = pixels;
+	px.intensity = inten;
+	px.texW = texW;
+	px.texH = texH;
+	px.duration = double.!(numSamples) / double.!(sampleRate);
+	px.sampleRate = sampleRate;
+	return true;
+}
+
+// Order-sensitive checksum over bytes (int32 wraparound).
+def byteSum(a: Array<byte>) -> int {
+	var h = 0;
+	for (b in a) h = h * 31 + b;
+	return h;
+}
+
+def TRACK_MS = 20000;	// max track length (milliseconds)
+
+// Parameters of the checked-in clips (must match inputs/songs.list), in the
+// order the clip paths are given on the command line.
+class ClipSpec(bpm: double, a4: double, bpc: int, roots: Array<int>, minors: Array<bool>) { }
+def CLIPS = [
+	ClipSpec.new(120.0, 440.0, 4, [0, 9, 5, 7], [false, true, false, false]),	// Spectrogram-a.wav
+	ClipSpec.new(96.0, 440.0, 4, [2, 11, 7, 9], [false, true, false, false]),	// Spectrogram-b.wav
+	ClipSpec.new(80.0, 437.0, 3, [7, 4, 0, 2], [false, true, false, false])	// Spectrogram-c.wav
+];
+
+var failures = 0;
+def check(desc: string, ok: bool) {
+	System.puts("check "); System.puts(desc); System.puts(": ");
+	System.puts(if(ok, "PASS", "FAIL"));
+	System.ln();
+	if (!ok) failures++;
+}
+
+// Usage: Spectrogram <millis> <clip-a.wav> <clip-b.wav> <clip-c.wav>
+// Renders consecutive tracks of up to 20 s (cycling through the clips, each
+// tiled to the track length) until <millis> ms of audio have been rendered.
+def main(args: Array<string>) -> int {
+	if (args.length < 1 + CLIPS.length) {
+		System.puts("Usage: Spectrogram <millis> <clip-a.wav> <clip-b.wav> <clip-c.wav>\n");
+		return 1;
+	}
+	calibrate();
+	var remaining = Int.parse(args[0]);
+	var total = 0;
+	for (k = 0; remaining > 0; k++) {
+		var ms = DspMath.imin(remaining, TRACK_MS);
+		remaining -= ms;
+		var ci = k % CLIPS.length, spec = CLIPS[ci];
+		var song = SynthSong.new();
+		song.sampleRate = 22050;
+		song.channels = 1;
+		song.bpm = spec.bpm;
+		song.a4 = spec.a4;
+		song.beatsPerChord = spec.bpc;
+		song.roots = spec.roots;
+		song.minors = spec.minors;
+		song.seconds = double.!(ms) / 1000.0;
+		song.loadTiled(args[1 + ci]);
+
+		var px = SpectrogramPixels.new();
+		var ok = computePixels(px, song.pcm, song.frames, song.sampleRate);
+		if (!ok) { System.puts("failed\n"); return 1; }
+		report(k, px, song);
+		total = total * 31 + byteSum(px.rgba) + byteSum(px.intensity);
+	}
+	DspOut.label("total"); System.puti(total); System.ln();
+	return if(failures == 0, 0, 1);
+}
+
+// Calibration: a full-scale sine centred on bin 93 (~1001 Hz).  The Hann
+// window's coherent gain is (N-1)/2N, so the peak is -6.02 dB -> intensity 236,
+// and a bin-centred sine has (ideally) zero response beyond the main lobe.
+def CAL_BIN = 93;
+def calibrate() {
+	var n = FFT_N + 3 * HOP, sr = 22050;
+	var sig = Array<float>.new(n);
+	var w = DspMath.TWO_PI * CAL_BIN / FFT_N;
+	for (i < n) sig[i] = float.roundd(DspMath.sin(w * i));
+	var px = SpectrogramPixels.new();
+	computePixels(px, sig, n, sr);
+	var col = 0, peakBin = 0, peak = 0, far = 0;
+	for (bin < px.texH) {
+		var v = int.!(px.intensity[(px.texH - 1 - bin) * px.texW + col]);
+		if (v > peak) { peak = v; peakBin = bin; }
+		var d = bin - CAL_BIN;
+		if ((d > 1 || d < -1) && v > far) far = v;
+	}
+	System.puts("calibration "); System.puti(px.texW); System.putc('x'); System.puti(px.texH);
+	System.puts(" peak-bin="); System.puti(peakBin);
+	System.puts(" peak="); System.puti(peak);
+	System.puts(" sidelobe-max="); System.puti(far);
+	System.puts(" rgba-sum="); System.puti(byteSum(px.rgba));
+	System.ln();
+	check("calibration peak at bin 93", peakBin == CAL_BIN);
+	check("calibration peak intensity 236 +- 1 (-6.02 dB)", peak >= 235 && peak <= 237);
+	check("calibration off-peak bins below -60 dB", far < 64);
+}
+
+// Print a per-track summary that consumes every pixel, and ground-truth checks.
+def report(k: int, px: SpectrogramPixels, song: SynthSong) {
+	var w = px.texW, h = px.texH;
+	System.puts("track "); System.puti(k);
+	System.puts(" bpm="); DspOut.putd(song.bpm, 0);
+	System.puts(" "); System.puti(w); System.putc('x'); System.puti(h);
+	System.puts(" dur="); DspOut.putd(px.duration, 2);
+	System.ln();
+	DspOut.label("  rgba-sum"); System.puti(byteSum(px.rgba)); System.ln();
+	DspOut.label("  inten-sum"); System.puti(byteSum(px.intensity)); System.ln();
+	// Row means, the strongest row (ignoring DC), and band means.
+	var totalI = 0L, bestRow = 0, bestSum = -1L, lowI = 0L, lowN = 0, highI = 0L, highN = 0;
+	var binHz = double.!(px.sampleRate) / FFT_N;
+	for (row < h) {
+		var s = 0L;
+		for (col < w) s += px.intensity[row * w + col];
+		totalI += s;
+		var bin = (h - 1) - row;
+		if (bin >= 2 && s > bestSum) { bestSum = s; bestRow = row; }
+		var hz = bin * binHz;
+		if (bin >= 2 && hz < 1000.0) { lowI += s; lowN++; }
+		if (hz > 8000.0) { highI += s; highN++; }
+	}
+	var peakBin = (h - 1) - bestRow;
+	var peakHz = double.!(peakBin) * binHz;
+	var lowMean = double.!(lowI) / (lowN * w), highMean = double.!(highI) / (highN * w);
+	DspOut.label("  mean-inten"); DspOut.putd(double.!(totalI) / (w * h), 3); System.ln();
+	DspOut.label("  band-means"); DspOut.putd(lowMean, 3); System.puts(" (<1k) "); DspOut.putd(highMean, 3); System.puts(" (>8k)"); System.ln();
+	// Nearest harmonic (1..4) of any chord tone (triad in octave 4 or bass in octave 2).
+	var tone = nearestTone(song, peakHz);
+	DspOut.label("  peak-hz"); DspOut.putd(peakHz, 1);
+	System.puts(" (nearest chord harmonic "); DspOut.putd(tone, 1); System.puts(")");
+	System.ln();
+	var expectW = DspMath.imin((song.frames - FFT_N) / HOP + 1, MAX_TEXW);
+	check("width = STFT frames", w == expectW && h == BINS);
+	var d = peakHz - tone;
+	check("peak row within 1 bin of a chord-tone harmonic", d <= binHz && d >= -binHz);
+	check("band <1 kHz brighter than >8 kHz", lowMean > highMean);
+}
+def nearestTone(song: SynthSong, hz: double) -> double {
+	var best = 0.0, bestD = 1e9;
+	for (c < song.roots.length) {
+		var r = song.roots[c], m = song.minors[c];
+		var notes = [60 + r, 60 + r + if(m, 3, 4), 60 + r + 7, 36 + r];
+		for (n in notes) {
+			var f = song.midiFreq(n);
+			for (hh = 1; hh <= 4; hh++) {
+				var d = hz - f * hh;
+				if (d < 0) d = -d;
+				if (d < bestD) { bestD = d; best = f * hh; }
+			}
+		}
+	}
+	return best;
+}

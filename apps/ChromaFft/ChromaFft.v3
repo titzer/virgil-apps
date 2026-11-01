@@ -1,0 +1,16 @@
+// Copyright 2026 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Beat-synchronous FFT-based chroma (beatmapper HPS, Spectral Peaks, and
+// HPS + Peaks) over a synthetic song.  Kernels are in ChromaHpsPeaks.v3.
+def main(args: Array<string>) -> int {
+	var song = ChromaBench.song(args, 440.0);
+	// HPS and peaks suppress chord thirds/fifths, so their triad guesses are
+	// known to be weak (e.g. F -> C#, Am -> F); the thresholds reflect that.
+	var ok = ChromaBench.run(song, [
+		ChromaAlgo.new("hps", ChromaHps.run, 95, 60),
+		ChromaAlgo.new("peaks", ChromaPeaks.run, 95, 20),
+		ChromaAlgo.new("hps_peaks", ChromaHpsPeaks.run, 95, 60)
+	]);
+	return if(ok, 0, 1);
+}

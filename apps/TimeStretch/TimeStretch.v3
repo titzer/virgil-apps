@@ -1,0 +1,637 @@
+// Copyright 2026 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Phase-vocoder time stretch + pitch shift, ported from beatmapper's
+// src/stretch.cpp (the STRETCH_ENGINE_PV engine):
+//
+//   pcm --> phase vocoder, time-scaled by speed/pitch --> sinc resampler, by pitch
+//
+// STFT with a Hann window of 3/4 N zero-padded to an N-point FFT (OVERLAP
+// synthesis hops per window), both channels in one packed complex FFT,
+// phase-gradient heap integration (identity-preserving, after Prusa &
+// Holighaus) so main lobes and attacks stay coherent, overlap-add into a
+// stretched stream, then a Kaiser-windowed sinc resampler that reads the
+// stretched stream at rate `pitch`.
+//
+// The miniaudio data source, atomics, loop/override/cursor plumbing and the
+// Signalsmith engine are omitted; the benchmark drives the engine offline.
+
+def PI = 3.14159265358979323846;
+
+// ---- tuning (as in stretch.cpp) ------------------------------------------
+def OVERLAP = 4;	// window / synthesis hop
+def KW = 16;		// resampler kernel half-width, in zero crossings
+def KRES = 512;		// kernel table entries per zero crossing
+def KBETA = 9.0;	// Kaiser beta for the kernel (~-90 dB sidelobes)
+def RING = 64;		// hop history (power of two)
+def QUIET = 1e-10f;	// bins this far below the loudest are float noise
+def MAX_CH = 2;
+
+// ---- FFT (stretch.cpp layout) --------------------------------------------
+// Iterative radix-2 complex FFT with precomputed twiddles and bit reversal.
+class StFft(n: int) {
+	def cs = Array<float>.new(n / 2);	// cos(2 pi j / n), j < n/2
+	def sn = Array<float>.new(n / 2);	// -sin(2 pi j / n)
+	def rev = Array<int>.new(n);
+
+	new() {
+		for (j < n / 2) {
+			cs[j] = float.roundd(DspMath.cos(2.0 * PI * j / n));
+			sn[j] = float.roundd(-DspMath.sin(2.0 * PI * j / n));
+		}
+		var bits = 0;
+		while ((1 << byte.!(bits)) < n) bits++;
+		for (i < n) {
+			var r = 0;
+			for (b < bits) if ((i & (1 << byte.!(b))) != 0) r |= 1 << byte.!(bits - 1 - b);
+			rev[i] = r;
+		}
+	}
+	// Forward, unnormalized, in place.
+	def run(re: Array<float>, im: Array<float>) {
+		for (i < n) {
+			var j = rev[i];
+			if (i < j) {
+				var t = re[i]; re[i] = re[j]; re[j] = t;
+				t = im[i]; im[i] = im[j]; im[j] = t;
+			}
+		}
+		var step = n / 2;
+		for (len = 2; len <= n; len <<= 1) {
+			var half = len >> 1;
+			for (i = 0; i < n; i += len) {
+				for (j < half) {
+					var wr = cs[j * step], wi = sn[j * step];
+					var a = i + j, b = a + half;
+					var vr = re[b] * wr - im[b] * wi;
+					var vi = re[b] * wi + im[b] * wr;
+					re[b] = re[a] - vr; im[b] = im[a] - vi;
+					re[a] += vr;        im[a] += vi;
+				}
+			}
+			step >>= 1;
+		}
+	}
+}
+
+// The transform of x + i*y, split into the half spectra (bins 0..n/2) of the
+// real signals x and y.
+def fft_unpack(re: Array<float>, im: Array<float>, n: int,
+		xr: Array<float>, xi: Array<float>, yr: Array<float>, yi: Array<float>) {
+	for (k = 0; k <= n / 2; k++) {
+		var m = (n - k) & (n - 1);
+		xr[k] = 0.5f * (re[k] + re[m]);
+		xi[k] = 0.5f * (im[k] - im[m]);
+		yr[k] = 0.5f * (im[k] + im[m]);
+		yi[k] = 0.5f * (re[m] - re[k]);
+	}
+}
+
+def princarg(a: double) -> double {
+	return a - 2.0 * PI * double.floor(a / (2.0 * PI) + 0.5);
+}
+
+def bessel_i0(x: double) -> double {
+	var sum = 1.0, term = 1.0;
+	for (k = 1; k < 50; k++) {
+		term *= (x / (2.0 * k)) * (x / (2.0 * k));
+		sum += term;
+		if (term < sum * 1e-12) break;
+	}
+	return sum;
+}
+
+def floorl(x: double) -> long { return long.truncd(double.floor(x)); }
+
+// ---- the engine ------------------------------------------------------------
+// fftSize: 0 selects stretch.cpp's choice (8192 above 64 kHz, else 4096);
+// a smaller power of two shrinks the window/hop (used for the tiny run).
+class Stretch(pcm: Array<float>, frames: int, ch: int, sampleRate: int, fftSize: int) {
+	var speed = 1.0f;
+	var pitch = 1.0f;
+
+	def N = if(fftSize > 0, fftSize, if(sampleRate > 64000, 8192, 4096));	// FFT size
+	def NB = N / 2 + 1;				// bins
+	def W = N * 3 / 4;				// window length (zero-padded to N)
+	def H = W / OVERLAP;				// synthesis hop
+	def L = 2 * H * ((W + 2 * H - 1) / (2 * H));	// synthesis span
+	def fft = StFft.new(N);
+	def win = Array<float>.new(N);	// Hann of length W centred in N
+	var ola_gain: float;
+
+	def wr = Array<float>.new(N);
+	def wi = Array<float>.new(N);
+	def vr = Array<float>.new(N);
+	def vi = Array<float>.new(N);
+	def lr = Array<float>.new(NB);
+	def li = Array<float>.new(NB);
+	def rr = Array<float>.new(NB);
+	def ri = Array<float>.new(NB);
+	var phase_in = Array<float>.new(NB);
+	var phase_prev = Array<float>.new(NB);
+	var pw = Array<float>.new(NB);
+	var pw_prev = Array<float>.new(NB);
+	def phase_out = Array<double>.new(NB);
+	def rot = Array<float>.new(NB);
+	def hkey = Array<float>.new(2 * NB);
+	def hid = Array<int>.new(2 * NB);
+	var hn = 0;
+	def done = Array<bool>.new(NB);
+	def ola = Array<float>.new(L * MAX_CH);
+
+	var first = true;
+	var apos = 0.0;
+	var prev_c = long.min;
+
+	// Stretched stream: samples [sb_base, sb_base + sb_len) live in sb.
+	def sb_cap = 4 * N;
+	def sb = Array<float>.new(4 * N * MAX_CH);
+	var sb_len = 0;
+	var sb_base = 0L;
+	var hops = 0L;
+	def ringCentre = Array<double>.new(RING);
+	def ringRate = Array<float>.new(RING);
+	def ringPitch = Array<float>.new(RING);
+
+	var rpos = 0.0;
+	def ktab = Array<float>.new(KW * KRES + 2);
+
+	new() {
+		for (i < N) {
+			var j = i - (N - W) / 2;
+			win[i] = if(j >= 0 && j < W, float.roundd(0.5 - 0.5 * DspMath.cos(2.0 * PI * j / W)), 0.0f);
+		}
+		var wsum = 0.0;
+		for (i = (N / 2 + H / 2) % H; i < N; i += H) wsum += double.!(win[i]) * win[i];
+		ola_gain = float.roundd(1.0 / wsum);
+
+		var i0b = bessel_i0(KBETA);
+		for (i = 0; i <= KW * KRES + 1; i++) {
+			var t = double.!(i) / KRES;
+			var s = if(i == 0, 1.0, DspMath.sin(PI * t) / (PI * t));
+			var u = t / KW;
+			var w = if(u < 1.0, bessel_i0(KBETA * double.sqrt(1.0 - u * u)) / i0b, 0.0);
+			ktab[i] = float.roundd(s * w);
+		}
+	}
+
+	def clampedPitch() -> float {
+		var p = pitch;
+		if (p < 0.25f) p = 0.25f;
+		if (p > 4.0f) p = 4.0f;
+		return p;
+	}
+	def clampedSpeed() -> float {
+		return if(speed < 0.05f, 0.05f, speed);
+	}
+
+	// Window the n frames centred on c into dst, rotated by n/2 (zero-phase framing).
+	// which: 0 = left, 1 = right, 2 = mono sum.  Out-of-range frames read 0.
+	def load_frame(c: long, which: int, dst: Array<float>) {
+		var n = N, half = n / 2;
+		for (i < n) {
+			var t = c - half + i;
+			var v = 0.0f;
+			if (win[i] != 0.0f && t >= 0 && t < frames) {
+				var s = int.!(t) * ch;
+				if (which == 2) v = if(ch > 1, pcm[s] + pcm[s + 1], pcm[s]);
+				else if (which < ch) v = pcm[s + which];
+			}
+			dst[(i + half) & (n - 1)] = v * win[i];
+		}
+	}
+
+	// ---- max-heap of (power, id); id = bin, + NB for a bin of the previous hop
+	def heap_push(k: float, id: int) {
+		var i = hn++;
+		while (i > 0) {
+			var p = (i - 1) >> 1;
+			if (hkey[p] >= k) break;
+			hkey[i] = hkey[p]; hid[i] = hid[p]; i = p;
+		}
+		hkey[i] = k; hid[i] = id;
+	}
+	def heap_pop() -> int {
+		var top = hid[0];
+		hn--;
+		var k = hkey[hn], id = hid[hn];
+		var i = 0;
+		while (true) {
+			var c = 2 * i + 1;
+			if (c >= hn) break;
+			if (c + 1 < hn && hkey[c + 1] > hkey[c]) c++;
+			if (hkey[c] <= k) break;
+			hkey[i] = hkey[c]; hid[i] = hid[c]; i = c;
+		}
+		if (hn > 0) { hkey[i] = k; hid[i] = id; }
+		return top;
+	}
+
+	// Phase-gradient heap integration.  lag_r/lag_i is the mono spectrum one
+	// synthesis hop before the current frame (null: phase_prev serves).
+	def integrate_phases(lag_r: Array<float>, lag_i: Array<float>) {
+		var pmax = 0.0f;
+		for (k < NB) if (pw[k] > pmax) pmax = pw[k];
+		var tol = DspMath.fmax(pmax * QUIET, 1e-12f);
+
+		hn = 0;
+		var open = 0;
+		for (k < NB) {
+			rot[k] = 0.0f;
+			var quiet = first || pw[k] <= tol;
+			done[k] = quiet;
+			if (!quiet) open++;
+			if (!first && pw_prev[k] > tol) heap_push(pw_prev[k], k + NB);
+		}
+		while (open > 0) {
+			if (hn == 0) {
+				// Nothing to inherit from: the loudest open bin keeps its input phase.
+				var best = -1;
+				for (k < NB) if (!done[k] && (best < 0 || pw[k] > pw[best])) best = k;
+				done[best] = true; open--;
+				heap_push(pw[best], best);
+				continue;
+			}
+			var id = heap_pop();
+			if (id >= NB) {
+				var k = id - NB;
+				if (done[k]) continue;
+				var omega_k = 2.0 * PI * k / N;
+				var phase_a = if(lag_r != null, DspMath.atan2(lag_i[k], lag_r[k]), double.!(phase_prev[k]));
+				var omega = omega_k + princarg(phase_in[k] - phase_a - omega_k * H) / H;
+				rot[k] = float.roundd(princarg(phase_out[k] + omega * H - phase_in[k]));
+				done[k] = true; open--;
+				heap_push(pw[k], k);
+			} else {
+				for (j = id - 1; j <= id + 1; j += 2) {
+					if (j < 0 || j >= NB || done[j]) continue;
+					rot[j] = rot[id];
+					done[j] = true; open--;
+					heap_push(pw[j], j);
+				}
+			}
+		}
+	}
+
+	// Produce one synthesis hop (H stretched frames) and append it to sb.
+	def pv_hop() {
+		var p = clampedPitch(), s = clampedSpeed();
+		var ha = double.!(H) * s / p;	// analysis hop
+
+		var c = floorl(apos + 0.5);
+		var ri = int.!(hops & (RING - 1));
+		ringCentre[ri] = apos;
+		ringRate[ri] = float.roundd(ha / H);
+		ringPitch[ri] = p;
+
+		// Both channels at c in one packed FFT.
+		load_frame(c, 0, wr);
+		load_frame(c, 1, wi);
+		fft.run(wr, wi);
+		fft_unpack(wr, wi, N, lr, li, rr, this.ri);
+		for (k < NB) {
+			var mr = lr[k] + rr[k], mi = li[k] + this.ri[k];
+			phase_in[k] = DspMath.atan2f(mi, mr);
+			pw[k] = lr[k] * lr[k] + li[k] * li[k] + rr[k] * rr[k] + this.ri[k] * this.ri[k];
+		}
+
+		if (first) {
+			integrate_phases(null, null);
+		} else if (c - H == prev_c) {
+			integrate_phases(null, null);
+		} else {
+			load_frame(c - H, 2, vr);
+			for (i < N) vi[i] = 0.0f;
+			fft.run(vr, vi);
+			integrate_phases(vr, vi);
+		}
+		rot[0] = 0.0f;
+		rot[NB - 1] = 0.0f;	// DC and Nyquist must stay real
+
+		// Rotate both channels by the same angles, remember the mono output
+		// phase, and pack the two real spectra for a single inverse FFT.
+		for (k < NB) {
+			var cr = DspMath.cosf(rot[k]), ci = DspMath.sinf(rot[k]);
+			var l_r = lr[k] * cr - li[k] * ci, l_i = lr[k] * ci + li[k] * cr;
+			var r_r = rr[k] * cr - this.ri[k] * ci, r_i = rr[k] * ci + this.ri[k] * cr;
+			phase_out[k] = princarg(double.!(phase_in[k]) + rot[k]);
+			wr[k] = l_r - r_i;
+			wi[k] = -(l_i + r_r);
+			if (k > 0 && k < NB - 1) {
+				wr[N - k] = l_r + r_i;
+				wi[N - k] = l_i - r_r;
+			}
+		}
+		fft.run(wr, wi);
+		// Inverse = conj(fft(conj Z)) / N: real part is left, -imag part is right.
+		var g = ola_gain / float.roundi(N);
+		var half = N / 2;
+		for (i < L) {
+			var n = i - L / 2 + half;
+			var j = (n + half) & (N - 1);
+			var w = win[n] * g;
+			ola[i * MAX_CH + 0] += wr[j] * w;
+			ola[i * MAX_CH + 1] -= wi[j] * w;
+		}
+
+		// Emit the first H frames into the stretched stream.
+		if (sb_len + H > sb_cap) {
+			var keep_from = floorl(rpos) - (KW * 4 + 8);
+			var drop = int.!(keep_from - sb_base);
+			if (drop > sb_len) drop = sb_len;
+			if (drop > 0) {
+				var cnt = (sb_len - drop) * MAX_CH, off = drop * MAX_CH;
+				for (i < cnt) sb[i] = sb[i + off];
+				sb_len -= drop;
+				sb_base += drop;
+			}
+		}
+		var dst = sb_len * MAX_CH;
+		for (i < H * MAX_CH) sb[dst + i] = ola[i];
+		sb_len += H;
+		var off = H * MAX_CH, cnt = (L - H) * MAX_CH;
+		for (i < cnt) ola[i] = ola[i + off];
+		for (i = cnt; i < L * MAX_CH; i++) ola[i] = 0.0f;
+
+		var t = pw_prev; pw_prev = pw; pw = t;
+		t = phase_prev; phase_prev = phase_in; phase_in = t;
+		prev_c = c;
+		apos += ha;
+		hops++;
+		first = false;
+	}
+
+	// The hop whose frame is centred on stretched position x.
+	def hop_at(x: double) -> int {
+		var b = floorl(x / H);
+		return int.!((b - L / (2 * H)) & (RING - 1));
+	}
+	// Input frame that stretched position x was made from.
+	def input_time(x: double) -> double {
+		var b = floorl(x / H);
+		var hi = hop_at(x);
+		return ringCentre[hi] + (x - double.!(b) * H) * ringRate[hi];
+	}
+
+	// Restart the pipeline so the first output frame is input frame `frame`.
+	def reset(frame: int) {
+		var ha = double.!(H) * clampedSpeed() / clampedPitch();
+		var prime = L / H - 1, lag = L / (2 * H);
+		apos = double.!(frame) - (prime - lag) * ha;
+		prev_c = long.min;
+		hops = 0;
+		sb_base = 0;
+		sb_len = 0;
+		rpos = double.!(prime) * H;
+		first = true;
+		for (i < ola.length) ola[i] = 0.0f;
+		for (i < RING) { ringCentre[i] = 0.0; ringRate[i] = 0.0f; ringPitch[i] = 0.0f; }
+	}
+
+	// Render up to frameCount output frames into out (interleaved, ch channels)
+	// starting at frame `at`; returns the number written (less at end of input).
+	def read(out: Array<float>, at: int, frameCount: int) -> int {
+		var eof = double.!(frames);
+		var written = 0;
+		while (written < frameCount) {
+			var p = 1.0f, fc = 1.0f, reach = 0;
+			while (true) {
+				var made = hops * H, at0 = floorl(rpos);
+				if (made > at0 + H) {
+					p = ringPitch[hop_at(rpos)];
+					var d = p - 1.0f;
+					if (d < 0.0f) d = -d;
+					fc = if(d < 1e-6f, 1.0f, DspMath.fmin(1.0f, 0.97f / p));
+					reach = int.truncf(float.ceil(float.roundi(KW) / fc)) + 1;
+					if (made > at0 + reach) break;
+				}
+				pv_hop();
+			}
+			if (input_time(rpos) >= eof) break;
+
+			// Windowed-sinc interpolation at rpos (gain normalized to 1).
+			var i0 = floorl(rpos);
+			var frac = float.roundd(rpos - double.!(i0));
+			var acc0 = 0.0f, acc1 = 0.0f, wsum = 0.0f;
+			var scale = fc * float.roundi(KRES);
+			var base = int.!(i0 - sb_base) * MAX_CH;
+			for (j = -reach + 1; j <= reach; j++) {
+				var t = float.roundi(j) - frac;
+				if (t < 0.0f) t = -t;
+				t = t * scale;
+				var ti = int.truncf(t);
+				if (ti >= KW * KRES) continue;
+				var w = ktab[ti] + (ktab[ti + 1] - ktab[ti]) * (t - float.roundi(ti));
+				var s = base + j * MAX_CH;
+				acc0 += sb[s] * w;
+				acc1 += sb[s + 1] * w;
+				wsum += w;
+			}
+			acc0 /= wsum; acc1 /= wsum;
+			var o = (at + written) * ch;
+			out[o] = acc0;
+			if (ch > 1) out[o + 1] = acc1;
+			written++;
+			rpos += p;
+		}
+		return written;
+	}
+}
+
+// ---- benchmark driver -------------------------------------------------------
+def BLOCK = 512;
+
+def render(song: SynthSong, speed: float, pitch: float, fftSize: int) -> (Array<float>, int) {
+	var st = Stretch.new(song.pcm, song.frames, song.channels, song.sampleRate, fftSize);
+	st.speed = speed;
+	st.pitch = pitch;
+	st.reset(0);
+	var cap = int.truncd(song.frames / double.!(speed)) + 4 * BLOCK;
+	var out = Array<float>.new(cap * song.channels);
+	var total = 0;
+	while (true) {
+		if (total + BLOCK > cap) {
+			var ncap = cap * 2;
+			var nout = Array<float>.new(ncap * song.channels);
+			for (i < total * song.channels) nout[i] = out[i];
+			out = nout; cap = ncap;
+		}
+		var n = st.read(out, total, BLOCK);
+		total += n;
+		if (n < BLOCK) break;
+	}
+	return (out, total);
+}
+
+def rms(a: Array<float>, frames: int, ch: int, c: int) -> double {
+	var sum = 0.0;
+	for (i < frames) { var v = a[i * ch + c]; sum += double.!(v) * v; }
+	return if(frames > 0, double.sqrt(sum / frames), 0.0);
+}
+
+// Write a run's output as raw little-endian f32 (for ref/ comparison).
+def dump(prefix: string, run: int, a: Array<float>, len: int) {
+	var path = Array<byte>.new(prefix.length + 5);
+	for (i < prefix.length) path[i] = prefix[i];
+	path[prefix.length] = byte.!('0' + run);
+	path[prefix.length + 1] = '.'; path[prefix.length + 2] = 'f';
+	path[prefix.length + 3] = '3'; path[prefix.length + 4] = '2';
+	var fd = System.fileOpen(path, false);
+	var bytes = Array<byte>.new(len * 4);
+	for (i < len) {
+		var u = u32.view(a[i]);
+		bytes[4 * i] = byte.view(u);
+		bytes[4 * i + 1] = byte.view(u >> 8);
+		bytes[4 * i + 2] = byte.view(u >> 16);
+		bytes[4 * i + 3] = byte.view(u >> 24);
+	}
+	System.fileWriteK(fd, bytes, 0, bytes.length);
+	System.fileClose(fd);
+}
+
+// Pitch-ratio estimator for the checks.  logSpectrum: magnitude of the mono
+// mix's average power spectrum (Hann-windowed 4096-point frames at hop 2048,
+// zero-padded at the end), resampled onto a log-frequency grid of LSTEP cents
+// from LF0 Hz.  estimateCents: the shift (in cents) of the output's log
+// spectrum that best correlates with the input's over [LBAND_LO, LBAND_HI] Hz.
+def CN = 4096;
+def LSTEP = 5;			// cents per log bin
+def LF0 = 25.0;			// Hz at log bin 0
+def LBINS = 2160;		// 9 octaves: 25 Hz .. 12.8 kHz
+def LBAND_LO = 240, LBAND_HI = 1920;	// log bins of 50 Hz .. 3.2 kHz
+def SEARCH = 20;		// lags searched either side of the expected shift (+-100 cents)
+var cfft: StFft;
+var cwin: Array<float>;
+def logSpectrum(a: Array<float>, frames: int, ch: int, sr: int) -> Array<double> {
+	if (cfft == null) {
+		cfft = StFft.new(CN);
+		cwin = Array<float>.new(CN);
+		for (i < CN) cwin[i] = float.roundd(0.5 - 0.5 * DspMath.cos(2.0 * PI * i / CN));
+	}
+	var fft = cfft, w = cwin;
+	var re = Array<float>.new(CN), im = Array<float>.new(CN);
+	var pw = Array<double>.new(CN / 2 + 1);
+	for (start = 0; start < frames; start += CN / 2) {
+		for (i < CN) {
+			var t = start + i, v = 0.0f;
+			if (t < frames) {
+				v = a[t * ch];
+				if (ch > 1) v = (v + a[t * ch + 1]) * 0.5f;
+			}
+			re[i] = v * w[i];
+			im[i] = 0.0f;
+		}
+		fft.run(re, im);
+		for (k < pw.length) pw[k] += double.!(re[k]) * re[k] + double.!(im[k]) * im[k];
+	}
+	var ls = Array<double>.new(LBINS);
+	var step = DspMath.pow(2.0, double.!(LSTEP) / 1200.0), f = LF0;
+	for (j < LBINS) {
+		if (j > 0) f *= step;
+		var x = f * CN / sr;
+		var k = int.truncd(x);
+		if (k + 1 >= pw.length) break;
+		var fr = x - k;
+		ls[j] = double.sqrt(pw[k] + (pw[k + 1] - pw[k]) * fr);
+	}
+	return ls;
+}
+// Searches shifts within SEARCH log bins of the expected one, so a wrong
+// pitch shows up as a best match at the edge of the window (and fails).
+def estimateCents(inS: Array<double>, outS: Array<double>, wantCents: int) -> int {
+	var c0 = wantCents / LSTEP;
+	var bestLag = 0, bestCorr = -1.0;
+	for (m = c0 - SEARCH; m <= c0 + SEARCH; m++) {
+		var xy = 0.0, xx = 0.0, yy = 0.0;
+		for (j = LBAND_LO; j < LBAND_HI; j++) {
+			var x = inS[j], y = outS[j + m];
+			xy += x * y; xx += x * x; yy += y * y;
+		}
+		var c = if(xx > 0 && yy > 0, xy / double.sqrt(xx * yy), 0.0);
+		if (c > bestCorr) { bestCorr = c; bestLag = m; }
+	}
+	return bestLag * LSTEP;
+}
+
+var failures = 0;
+def check(what: string, ok: bool) {
+	System.puts("  check ");
+	System.puts(what);
+	System.puts(if(ok, ": PASS\n", ": FAIL\n"));
+	if (!ok) failures++;
+}
+
+def RMS_TOL = 0.10;		// stretched output rms within 10% of input
+def CENTS_TOL = 10;		// estimated pitch shift within 10 cents of the setting
+
+// Usage: TimeStretch <song.wav> <centiseconds of audio> [settings (0..5)] [fft size (0 = default)] [dump-prefix]
+def main(args: Array<string>) -> int {
+	if (args.length < 2) {
+		System.puts("Usage: TimeStretch <song.wav> <centiseconds> [settings] [fftsize] [dump-prefix]\n");
+		return 1;
+	}
+	var cs = Int.parse(args[1]);
+	var nset = if(args.length > 2, Int.parse(args[2]), 5);
+	var fftSize = if(args.length > 3, Int.parse(args[3]), 0);
+	var dumpPrefix = if(args.length > 4, args[4]);
+	var song = SynthSong.new();
+	song.seconds = double.!(cs) / 100.0;
+	song.loadTiled(args[0]);
+	var ch = song.channels, sr = song.sampleRate;
+
+	var inL = rms(song.pcm, song.frames, ch, 0), inR = rms(song.pcm, song.frames, ch, 1);
+	var inS = logSpectrum(song.pcm, song.frames, ch, sr);
+	DspOut.label("input frames"); DspOut.putl(song.frames);
+	System.puts(", rms "); DspOut.putd(inL, 5);
+	System.puts(" "); DspOut.putd(inR, 5);
+	System.ln();
+
+	var semis3 = float.roundd(DspMath.pow(2.0, 3.0 / 12.0));
+	var speeds = [1.0f, 0.75f, 1.25f, 1.0f, 0.8f];
+	var pitches = [1.0f, 1.0f, 1.0f, semis3, 0.75f];
+	if (nset > speeds.length) nset = speeds.length;
+	for (s < nset) {
+		var sp = speeds[s], pt = pitches[s];
+		var r = render(song, sp, pt, fftSize);
+		var out = r.0, n = r.1;
+		var oL = rms(out, n, ch, 0), oR = rms(out, n, ch, 1);
+		var wantCents = int.truncd(double.round(1200.0 * DspMath.log2(pt)));
+		var cents = estimateCents(inS, logSpectrum(out, n, ch, sr), wantCents);
+		var expect = song.frames / double.!(sp);
+		System.puts("speed "); DspOut.putf(sp, 2);
+		System.puts(" pitch "); DspOut.putf(pt, 4);
+		System.puts(": frames "); DspOut.putl(n);
+		System.puts(" (expect "); DspOut.putd(expect, 1);
+		System.puts("), rms "); DspOut.putd(oL, 5);
+		System.puts(" "); DspOut.putd(oR, 5);
+		System.puts(", shift "); DspOut.putl(cents); System.puts(" cents");
+		System.puts(", checksum "); DspOut.putl(DspOut.checksum(out, 0, n * ch));
+		System.ln();
+		if (dumpPrefix != null) dump(dumpPrefix, s, out, n * ch);
+		var dn = double.!(n) - expect;
+		check("length within 1 frame of input/speed", dn > -1.0 && dn <= 1.0);
+		check("rms within 10% of input (both channels)",
+			double.abs(oL / inL - 1.0) < RMS_TOL && double.abs(oR / inR - 1.0) < RMS_TOL);
+		var dc = cents - wantCents;
+		check("spectral shift within 10 cents of pitch", dc >= -CENTS_TOL && dc <= CENTS_TOL);
+		if (sp == 1.0f && pt == 1.0f) {
+			// Identity: the pipeline must reproduce the input.
+			var len = DspMath.imin(n, song.frames) * ch, maxErr = 0.0, err2 = 0.0, sig2 = 0.0;
+			for (i < len) {
+				var d = double.abs(double.!(out[i]) - song.pcm[i]);
+				if (d > maxErr) maxErr = d;
+				err2 += d * d;
+				sig2 += double.!(song.pcm[i]) * song.pcm[i];
+			}
+			var snr = if(err2 > 0, 10.0 * DspMath.log10(sig2 / err2), 999.0);
+			check("identity length exact", n == song.frames);
+			check("identity max abs error < 1e-4", maxErr < 1e-4);
+			check("identity transparency SNR > 80 dB", snr > 80.0);
+		}
+	}
+	if (failures > 0) {
+		System.puts("FAILED checks: "); DspOut.putl(failures); System.ln();
+		return 1;
+	}
+	return 0;
+}

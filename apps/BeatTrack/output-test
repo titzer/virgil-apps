@@ -1,0 +1,25 @@
+odf-frames: 1288
+flux-sum: 1918561433
+low-sum: 236110412
+flux-total: 533.681
+low-total: 115.887
+tau: 26.00
+bpm: 99.38
+onsets: 49
+onset-sum: -2034186551
+beats: 50
+beat-sum: 371214749
+first: 0.000 0.527 1.131 1.711 2.315 2.919 3.523 4.126
+median-ibi: 0.6037
+true-bpm: 100.00
+true-beats: 50
+beat-offset-ms: -80.1
+beats-on-grid: 49/50
+onset-offset-ms: -51.0
+onsets-on-grid: 49/49
+check bpm within 1 of true: PASS
+check beat count within 2 of min(true, 2048): PASS
+check median ibi within 2% of true period: PASS
+check beat latency within 100 ms: PASS
+check beats on grid >= 95%: PASS
+check onsets on grid >= 90%: PASS

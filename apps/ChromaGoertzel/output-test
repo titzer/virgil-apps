@@ -1,0 +1,14 @@
+0 C: C/C C/C
+1 C: C/C C/C
+2 C: C/C C/C
+3 C: C/C C/C
+4 Am: A/Am A/Am
+5 Am: A/Am A/Am
+6 Am: A/Am A/Am
+7 Am: A/Am A/Am
+goertzel_hann: root 16/16 triad 16/16 cos 0.817 checksum 1528233584
+goertzel_blackman: root 16/16 triad 16/16 cos 0.762 checksum -1107747612
+check goertzel_hann root accuracy >= 95%: PASS (16/16)
+check goertzel_hann triad accuracy >= 95%: PASS (16/16)
+check goertzel_blackman root accuracy >= 95%: PASS (16/16)
+check goertzel_blackman triad accuracy >= 95%: PASS (16/16)

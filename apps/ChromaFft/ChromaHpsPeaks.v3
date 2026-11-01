@@ -1,0 +1,152 @@
+// Copyright 2026 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// FFT-based chroma algorithms from beatmapper: Harmonic Product Spectrum
+// (chroma_hps.cpp), spectral peak-picking with harmonic grouping
+// (chroma_peaks.cpp), and their average (chroma_hps_peaks, chroma_algo.cpp).
+// Shared with apps/ChromaWhitened (whitened_hps_peaks).
+
+// ---------------------------------------------------------------------------
+// Harmonic Product Spectrum (HPS) chroma.
+// For each FFT frame, HPS[k] = |X[k]| * |X[2k]| * |X[3k]| * |X[4k]| * |X[5k]|,
+// accumulated into 12 pitch classes over the C2..C6 range (60..1100 Hz).
+// ---------------------------------------------------------------------------
+def HPS_N = 8192;	// FFT window size
+def HPS_ORDER = 5;	// number of harmonics to multiply
+
+component ChromaHps {
+	def re = Array<float>.new(HPS_N);
+	def im = Array<float>.new(HPS_N);
+	def mag = Array<float>.new(HPS_N / 2);
+	def win = Chroma.hann(HPS_N);
+
+	def run(pcm: Array<float>, frameCount: int, ch: int, sr: int, t0: double, t1: double, result: Array<float>) {
+		Chroma.zero(result);
+		if (pcm == null || frameCount == 0 || ch == 0 || sr == 0) return;
+		if (t1 - t0 > 8.0) t0 = t1 - 8.0;
+		var r = Chroma.range(t0, t1, sr, frameCount), fs = r.0, fe = r.1;
+		if (fe - fs < HPS_N) return;
+
+		var BINS = HPS_N / 2;
+		var freqPerBin = float.roundi(sr) / float.roundi(HPS_N);
+		var MAX_FUND_BIN = BINS / HPS_ORDER;	// max bin for a full HPS_ORDER-way product
+		var power = Array<double>.new(12);
+
+		for (pos = fs; pos + HPS_N <= fe; pos += HPS_N) {
+			Chroma.monoWin(pcm, ch, pos, win, re, im, HPS_N);
+			Chroma.fft(re, im, HPS_N);
+			for (k < BINS) mag[k] = float.sqrt(re[k] * re[k] + im[k] * im[k]);
+
+			for (k = 1; k < MAX_FUND_BIN; k++) {
+				var freq = float.roundi(k) * freqPerBin;
+				if (freq < 60.0f || freq > 1100.0f) continue;
+				var hps = mag[k];
+				for (h = 2; h <= HPS_ORDER; h++) hps *= mag[k * h];
+				power[Chroma.freqToPc(freq)] += hps;
+			}
+		}
+		Chroma.normDb(power, result);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Spectral peak-picking + harmonic grouping chroma: local maxima above a
+// threshold, sorted by frequency; peaks at integer multiples (within 3%) of an
+// earlier fundamental give it a small bonus, others become new fundamentals.
+// ---------------------------------------------------------------------------
+def PEAKS_N = 8192;		// FFT window size
+def MAX_PEAKS = 300;		// max peaks per frame
+def PEAK_THRESH = 0.04f;	// min peak magnitude as fraction of frame max
+def HARM_TOL = 0.03f;		// harmonic ratio tolerance (3%)
+
+component ChromaPeaks {
+	def re = Array<float>.new(PEAKS_N);
+	def im = Array<float>.new(PEAKS_N);
+	def mag = Array<float>.new(PEAKS_N / 2);
+	def win = Chroma.hann(PEAKS_N);
+	def peakFreq = Array<float>.new(MAX_PEAKS);
+	def peakMag = Array<float>.new(MAX_PEAKS);
+	def fundFreq = Array<float>.new(MAX_PEAKS);
+	def fundMag = Array<float>.new(MAX_PEAKS);
+
+	// Sort peaks by frequency ascending (insertion sort; replaces qsort).
+	def sortPeaks(n: int) {
+		for (i = 1; i < n; i++) {
+			var f = peakFreq[i], m = peakMag[i], j = i - 1;
+			while (j >= 0 && peakFreq[j] > f) {
+				peakFreq[j + 1] = peakFreq[j]; peakMag[j + 1] = peakMag[j];
+				j--;
+			}
+			peakFreq[j + 1] = f; peakMag[j + 1] = m;
+		}
+	}
+	def run(pcm: Array<float>, frameCount: int, ch: int, sr: int, t0: double, t1: double, result: Array<float>) {
+		Chroma.zero(result);
+		if (pcm == null || frameCount == 0 || ch == 0 || sr == 0) return;
+		if (t1 - t0 > 8.0) t0 = t1 - 8.0;
+		var r = Chroma.range(t0, t1, sr, frameCount), fs = r.0, fe = r.1;
+		if (fe - fs < PEAKS_N) return;
+
+		var BINS = PEAKS_N / 2;
+		var freqPerBin = float.roundi(sr) / float.roundi(PEAKS_N);
+		var power = Array<double>.new(12);
+
+		for (pos = fs; pos + PEAKS_N <= fe; pos += PEAKS_N) {
+			Chroma.monoWin(pcm, ch, pos, win, re, im, PEAKS_N);
+			Chroma.fft(re, im, PEAKS_N);
+			// Magnitude spectrum + frame max
+			var maxMag = 1e-30f;
+			for (k < BINS) {
+				mag[k] = float.sqrt(re[k] * re[k] + im[k] * im[k]);
+				if (mag[k] > maxMag) maxMag = mag[k];
+			}
+			// Collect local maxima in C2-C6 range
+			var nPeaks = 0;
+			var thresh = maxMag * PEAK_THRESH;
+			for (k = 1; k < BINS - 1 && nPeaks < MAX_PEAKS; k++) {
+				var f = float.roundi(k) * freqPerBin;
+				if (f < 60.0f || f > 1100.0f) continue;
+				if (mag[k] > mag[k - 1] && mag[k] > mag[k + 1] && mag[k] >= thresh) {
+					peakFreq[nPeaks] = f; peakMag[nPeaks] = mag[k];
+					nPeaks++;
+				}
+			}
+			sortPeaks(nPeaks);
+			// Harmonic grouping
+			var nFund = 0;
+			for (i < nPeaks) {
+				var f = peakFreq[i], harm = false;
+				for (j < nFund) {
+					var ratio = f / fundFreq[j];
+					var h = Chroma.roundf(ratio);
+					var fh = float.roundi(h);
+					if (h >= 2 && float.abs(ratio - fh) < HARM_TOL * fh) {
+						// A harmonic of fundamental j: reward the fundamental.
+						fundMag[j] += peakMag[i] * 0.15f;
+						harm = true;
+						break;
+					}
+				}
+				if (!harm && nFund < MAX_PEAKS) {
+					fundFreq[nFund] = f;
+					fundMag[nFund] = peakMag[i];
+					nFund++;
+				}
+			}
+			// Accumulate each fundamental into its pitch class
+			for (j < nFund) power[Chroma.freqToPc(fundFreq[j])] += fundMag[j];
+		}
+		Chroma.normDb(power, result);
+	}
+}
+
+// Average of HPS and Spectral Peaks (chroma_hps_peaks).
+component ChromaHpsPeaks {
+	def a = Array<float>.new(12);
+	def b = Array<float>.new(12);
+	def run(pcm: Array<float>, n: int, ch: int, sr: int, t0: double, t1: double, out: Array<float>) {
+		ChromaHps.run(pcm, n, ch, sr, t0, t1, a);
+		ChromaPeaks.run(pcm, n, ch, sr, t0, t1, b);
+		Chroma.average(a, b, out);
+	}
+}

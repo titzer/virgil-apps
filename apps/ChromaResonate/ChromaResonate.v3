@@ -1,0 +1,112 @@
+// Copyright 2026 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Beat-synchronous resonator-bank chroma (beatmapper chroma_resonate.cpp, after
+// Alexandre Francois' Resonate) over a synthetic song.  A bank of 60 complex
+// resonators (C2..B6) is updated once per input sample:
+//   P_k  unit phasor rotated by e^(-i w_k dt) every sample
+//   R_k  EWMA of the demodulated signal:  R += a_k (x P - R)
+//   S_k  second EWMA smoothing R:          S += b_k (R - S)
+// with a constant-Q rate a_k = 1 - e^(-2 pi dt BW (2^(1/12) - 1) f_k); each
+// resonator's power |S_k|^2 is averaged over the window after a warm-up.
+def OCT_LO = 2;				// lowest octave
+def OCT_HI = 6;				// highest octave
+def N_OCT = OCT_HI - OCT_LO + 1;	// 5
+def N_PC = 12;				// pitch classes
+def N_RES = N_PC * N_OCT;		// 60 resonators
+def BW_SEMITONES = 0.15f;		// half-bandwidth as a fraction of a semitone
+def BETA_SCALE = 0.5f;			// b_k = BETA_SCALE * a_k
+def RENORM_EVERY = 512;			// phasor renormalisation period (power of two)
+def WARMUP_TAU = 3.0f;			// time constants skipped at the window head
+def MAX_SAMPLES = 384000;		// largest span processed (~8 s at 48 kHz)
+
+component ChromaResonate {
+	def mono = Array<float>.new(MAX_SAMPLES);
+	def freq = Array<float>.new(N_RES);
+	def alpha = Array<float>.new(N_RES);
+	var tunedSr = 0;
+
+	// Resonator tuning table; a_k depends on the sample rate.
+	def ensureTuning(sr: int) {
+		if (tunedSr == sr) return;
+		var dt = 1.0f / float.roundi(sr);
+		// Half-bandwidth proportional to f: a constant-Q bank.
+		var semi = DspMath.powf(2.0f, 1.0f / 12.0f) - 1.0f;
+		for (oi < N_OCT) {
+			for (pc < N_PC) {
+				var midi = 12 * (OCT_LO + oi + 1) + pc;	// C4 = 60, A4 = 69
+				var f = 440.0f * DspMath.powf(2.0f, float.roundi(midi - 69) / 12.0f);
+				var r = oi * N_PC + pc;
+				freq[r] = f;
+				alpha[r] = 1.0f - DspMath.expf(-6.283185307179586f * BW_SEMITONES * semi * f * dt);
+			}
+		}
+		tunedSr = sr;
+	}
+	def run(pcm: Array<float>, frameCount: int, ch: int, sr: int, t0: double, t1: double, result: Array<float>) {
+		Chroma.zero(result);
+		if (pcm == null || frameCount == 0 || ch == 0 || sr == 0) return;
+		var rg = Chroma.range(t0, t1, sr, frameCount), fs = rg.0, fe = rg.1;
+		if (fe - fs > MAX_SAMPLES) fs = fe - MAX_SAMPLES;	// keep the tail
+		var nSamp = fe - fs;
+		if (nSamp <= 0) return;
+
+		ensureTuning(sr);
+
+		// Materialise the window as mono; the resonator loop is then
+		// resonator-outer / sample-inner.
+		var invCh = 1.0f / float.roundi(ch);
+		for (i < nSamp) {
+			var s = 0.0f;
+			for (c < ch) s += pcm[(fs + i) * ch + c];
+			mono[i] = s * invCh;
+		}
+
+		var twoPi = 6.283185307179586f;
+		var nyqLim = 0.45f * float.roundi(sr);	// ignore resonators too near Nyquist
+		var fsr = float.roundi(sr);
+		var power = Array<double>.new(N_PC);
+
+		for (r < N_RES) {
+			if (freq[r] >= nyqLim) continue;
+			var a = alpha[r];
+			var b = a * BETA_SCALE;
+			// Ignore the EWMA start-up transient (at most half the window).
+			var skip = int.truncf(WARMUP_TAU / a);
+			if (skip > nSamp / 2) skip = nSamp / 2;
+			// Constant per-sample rotation e^(-i w dt), w dt = 2 pi f / sr.
+			var th = twoPi * freq[r] / fsr;
+			var cw = DspMath.cosf(th), sw = -DspMath.sinf(th);
+
+			var pr = 1.0f, pi = 0.0f;	// phasor P
+			var rr = 0.0f, ri = 0.0f;	// resonator R
+			var qr = 0.0f, qi = 0.0f;	// smoothed S
+			var acc = 0.0;
+			var nacc = 0;
+			for (n < nSamp) {
+				// P *= e^(-i w dt)
+				var np = pr * cw - pi * sw;
+				pi = pr * sw + pi * cw;
+				pr = np;
+				if ((n & (RENORM_EVERY - 1)) == 0) {
+					var g = 1.0f / float.sqrt(pr * pr + pi * pi);
+					pr *= g; pi *= g;
+				}
+				var x = mono[n];
+				rr += a * (x * pr - rr);	// R += a (x P - R)
+				ri += a * (x * pi - ri);
+				qr += b * (rr - qr);		// S += b (R - S)
+				qi += b * (ri - qi);
+				if (n >= skip) { acc += qr * qr + qi * qi; nacc++; }
+			}
+			if (nacc != 0) power[r % N_PC] += acc / nacc;
+		}
+		Chroma.normDb(power, result);
+	}
+}
+
+def main(args: Array<string>) -> int {
+	var song = ChromaBench.song(args, 440.0);
+	var ok = ChromaBench.run(song, [ChromaAlgo.new("resonate", ChromaResonate.run, 95, 95)]);
+	return if(ok, 0, 1);
+}

@@ -1,0 +1,13 @@
+# Synthetic song clips for the beatmapper DSP benchmarks (regenerate: bin/gen-songs.bash).
+# <file.wav> [seconds= sr= ch= bpm= a4x10= seed= bpc= roots= minors=]
+# Clips are tiled at run time (SynthSong.loadTiled) to the requested length; choose
+# seconds as a whole number of chord cycles where possible.
+TimeStretch-song.wav seconds=8 sr=22050 ch=2 bpm=120 a4x10=4400 seed=777 bpc=4 roots=0,9,5,7 minors=0,1,0,0
+Chroma-song.wav seconds=8 sr=22050 ch=2 bpm=120 a4x10=4400 seed=12345 bpc=4 roots=0,9,5,7 minors=0,1,0,0
+Chroma-song443.wav seconds=8 sr=22050 ch=2 bpm=120 a4x10=4430 seed=12345 bpc=4 roots=0,9,5,7 minors=0,1,0,0
+OnsetShape-drums.wav seconds=2 sr=22050 ch=2 bpm=120 a4x10=4400 seed=12345 bpc=1 roots=0,9,5,7 minors=0,1,0,0
+ChordDecode-prog6.wav seconds=3 sr=22050 ch=2 bpm=240 a4x10=4400 seed=4242 bpc=2 roots=0,9,5,7,2,4 minors=0,1,0,0,1,1
+BeatTrack-100bpm.wav seconds=12 sr=22050 ch=1 bpm=100 a4x10=4400 seed=777 bpc=4 roots=0,9,5,7,2 minors=0,1,0,0,1
+Spectrogram-a.wav seconds=8 sr=22050 ch=1 bpm=120 a4x10=4400 seed=101 bpc=4 roots=0,9,5,7 minors=0,1,0,0
+Spectrogram-b.wav seconds=10 sr=22050 ch=1 bpm=96 a4x10=4400 seed=202 bpc=4 roots=2,11,7,9 minors=0,1,0,0
+Spectrogram-c.wav seconds=9 sr=22050 ch=1 bpm=80 a4x10=4370 seed=303 bpc=3 roots=7,4,0,2 minors=0,1,0,0

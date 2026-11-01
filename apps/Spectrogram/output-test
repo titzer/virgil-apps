@@ -1,0 +1,32 @@
+calibration 4x1024 peak-bin=93 peak=236 sidelobe-max=0 rgba-sum=1249902260
+check calibration peak at bin 93: PASS
+check calibration peak intensity 236 +- 1 (-6.02 dB): PASS
+check calibration off-peak bins below -60 dB: PASS
+track 0 bpm=120 858x1024 dur=20.00
+  rgba-sum: 1524512005
+  inten-sum: -1961005581
+  mean-inten: 22.260
+  band-means: 64.273 (<1k) 17.919 (>8k)
+  peak-hz: 516.8 (nearest chord harmonic 523.3)
+check width = STFT frames: PASS
+check peak row within 1 bin of a chord-tone harmonic: PASS
+check band <1 kHz brighter than >8 kHz: PASS
+track 1 bpm=96 858x1024 dur=20.00
+  rgba-sum: 1408638761
+  inten-sum: 674253001
+  mean-inten: 19.283
+  band-means: 60.733 (<1k) 14.414 (>8k)
+  peak-hz: 107.7 (nearest chord harmonic 110.0)
+check width = STFT frames: PASS
+check peak row within 1 bin of a chord-tone harmonic: PASS
+check band <1 kHz brighter than >8 kHz: PASS
+track 2 bpm=80 212x1024 dur=5.00
+  rgba-sum: -263279482
+  inten-sum: 1534170584
+  mean-inten: 16.795
+  band-means: 61.717 (<1k) 11.730 (>8k)
+  peak-hz: 387.6 (nearest chord harmonic 389.3)
+check width = STFT frames: PASS
+check peak row within 1 bin of a chord-tone harmonic: PASS
+check band <1 kHz brighter than >8 kHz: PASS
+total: -1442472540

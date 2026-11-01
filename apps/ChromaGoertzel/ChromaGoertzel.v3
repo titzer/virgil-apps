@@ -1,0 +1,92 @@
+// Copyright 2026 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Beat-synchronous Goertzel chroma (beatmapper chroma_goertzel.cpp), with the
+// Hann and 4-term Blackman-Harris window variants, over a synthetic song.
+def GOERTZEL_N = 4096;	// samples per analysis frame
+
+component Goertzel {
+	// Pitch-class target frequencies: [pitch_class * 5 + octave_index], octaves 2..6.
+	def target = initTargets();
+	def mono = Array<float>.new(GOERTZEL_N);
+	def hannWin = initHann();
+	def blackmanWin = initBlackman();
+
+	def initTargets() -> Array<float> {
+		var t = Array<float>.new(60);
+		for (pc < 12) {
+			for (oi < 5) {
+				var oct = oi + 2;			// octaves 2, 3, 4, 5, 6
+				var midi = 12 * (oct + 1) + pc;		// C4=60, A4=69 convention
+				t[pc * 5 + oi] = 440.0f * DspMath.powf(2.0f, float.roundi(midi - 69) / 12.0f);
+			}
+		}
+		return t;
+	}
+	// Hann window: w[n] = 0.5 * (1 - cos(2 pi n/(N-1)))
+	def initHann() -> Array<float> {
+		return Chroma.hann(GOERTZEL_N);
+	}
+	// 4-term Blackman-Harris: -92 dB sidelobe level (vs -31 dB for Hann).
+	def initBlackman() -> Array<float> {
+		var w = Array<float>.new(GOERTZEL_N);
+		for (i < GOERTZEL_N) {
+			var t = 2.0f * Chroma.PIF * float.roundi(i) / float.roundi(GOERTZEL_N - 1);
+			w[i] = 0.35875f
+				- 0.48829f * DspMath.cosf(t)
+				+ 0.14128f * DspMath.cosf(2.0f * t)
+				- 0.01168f * DspMath.cosf(3.0f * t);
+		}
+		return w;
+	}
+	// Single-bin Goertzel filter applied to a windowed mono block.
+	def goertzel(mono: Array<float>, win: Array<float>, N: int, freq: float, sr: float) -> float {
+		var w = 2.0f * Chroma.PIF * freq / sr;
+		var coeff = 2.0f * DspMath.cosf(w);
+		var s1 = 0.0f, s2 = 0.0f;
+		for (i < N) {
+			var s0 = mono[i] * win[i] + coeff * s1 - s2;
+			s2 = s1; s1 = s0;
+		}
+		return s1 * s1 + s2 * s2 - coeff * s1 * s2;
+	}
+	def run(pcm: Array<float>, frameCount: int, ch: int, sr: int, t0: double, t1: double,
+			result: Array<float>, win: Array<float>) {
+		Chroma.zero(result);
+		if (pcm == null || frameCount == 0 || ch == 0 || sr == 0) return;
+		if (t1 - t0 > 8.0) t0 = t1 - 8.0;
+		var r = Chroma.range(t0, t1, sr, frameCount), fs = r.0, fe = r.1;
+		if (fe - fs < GOERTZEL_N) return;
+
+		var power = Array<double>.new(12);
+		var fch = float.roundi(ch), fsr = float.roundi(sr);
+		for (pos = fs; pos + GOERTZEL_N <= fe; pos += GOERTZEL_N) {
+			// Stereo -> mono
+			for (i < GOERTZEL_N) {
+				var s = 0.0f;
+				for (c < ch) s += pcm[(pos + i) * ch + c];
+				mono[i] = s / fch;
+			}
+			// One Goertzel filter per target note; accumulate into pitch class.
+			for (pc < 12) {
+				for (oi < 5) power[pc] += goertzel(mono, win, GOERTZEL_N, target[pc * 5 + oi], fsr);
+			}
+		}
+		Chroma.normDb(power, result);
+	}
+	def hann(pcm: Array<float>, frames: int, ch: int, sr: int, t0: double, t1: double, result: Array<float>) {
+		run(pcm, frames, ch, sr, t0, t1, result, hannWin);
+	}
+	def blackman(pcm: Array<float>, frames: int, ch: int, sr: int, t0: double, t1: double, result: Array<float>) {
+		run(pcm, frames, ch, sr, t0, t1, result, blackmanWin);
+	}
+}
+
+def main(args: Array<string>) -> int {
+	var song = ChromaBench.song(args, 440.0);
+	var ok = ChromaBench.run(song, [
+		ChromaAlgo.new("goertzel_hann", Goertzel.hann, 95, 95),
+		ChromaAlgo.new("goertzel_blackman", Goertzel.blackman, 95, 95)
+	]);
+	return if(ok, 0, 1);
+}

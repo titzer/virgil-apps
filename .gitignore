@@ -1,3 +1,4 @@
 out/
 config/*
 lib
+apps/SectionInfer/ref/gen_sections.inc

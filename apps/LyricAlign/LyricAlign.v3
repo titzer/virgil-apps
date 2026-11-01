@@ -1,0 +1,931 @@
+// Copyright 2026 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Lyric alignment benchmark: a port of beatmapper's lyric_align.cpp.
+//   1. lyric_activity: high-passed RMS loudness envelope (dB), smoothed
+//   2. lyric_syllables: vowel-group syllable counting of lyric text
+//   3. lyric_units: hysteresis thresholding, gap bridging, splitting at dips,
+//      syllable-nucleus counting
+//   4. solve: DP matching lines (in order) to runs of units, with skip costs
+//   5. lyric_align: anchors carved out, gaps between anchors, horizon windows,
+//      singing-rate search, relaxed thresholds for leftovers
+// Input is a deterministic synthetic "vocal" track: lyric lines are sung as
+// trains of amplitude-modulated harmonic tones (one bump per syllable), with
+// pauses between lines and the odd ad-lib in a pause, so the true start time
+// of every line is known.  One 16-line pass is synthesized at compile time and
+// tiled to the requested number of lines; the last 5 lines are a quiet chorus
+// (12 dB down) that only the relaxed-threshold passes see.
+// Args: <lines> [<anchors 0..3>].  Correctness checks against the ground truth
+// print PASS/FAIL; the exit code is 1 if any fails.
+// (Timed-lyrics hints, lyric_match_hints, are omitted.)
+
+// ---------------------------------------------------------------------------
+// Data types
+// ---------------------------------------------------------------------------
+class LyricActivity {
+	var hop = 0.01;			// seconds per envelope frame
+	var db: Array<float>;		// loudness, dB (high-passed RMS, smoothed)
+	var floor_db = -90.0f;
+	var peak_db = -90.0f;
+}
+
+class LyricUnit {
+	var t0: double;
+	var t1: double;
+	var gap_before: double;		// silence before it (0 when split at a dip)
+	var dip_before: float;		// depth of the loudness dip before it, dB
+	var nuclei: int;		// syllable-like loudness peaks inside
+	def copy() -> LyricUnit {
+		var u = LyricUnit.new();
+		u.t0 = t0; u.t1 = t1; u.gap_before = gap_before; u.dip_before = dip_before; u.nuclei = nuclei;
+		return u;
+	}
+}
+
+class LyricAlignParams {
+	var on_frac = 0.33f;
+	var max_below = 10.0f;
+	var bridge_gap = 0.20;
+	var min_unit = 0.15;
+	var split_len = 1.2;
+	var split_dip = 7.0f;
+	var rate_lo = 0.14;
+	var rate_hi = 0.55;
+	var max_run = 24;
+	var w_dur = 1.0f;
+	var w_nuc = 0.6f;
+	var w_inner = 1.2f;
+	var inner_ok = 0.50;
+	var w_break = 1.5f;
+	var break_ok = 0.30;
+	var w_skip = 0.70f;
+	var c_skip = 0.15f;
+	var c_unplaced = 4.0f;
+	var horizon = 4;
+	def copy() -> LyricAlignParams {
+		var p = LyricAlignParams.new();
+		p.on_frac = on_frac; p.max_below = max_below; p.bridge_gap = bridge_gap;
+		p.min_unit = min_unit; p.split_len = split_len; p.split_dip = split_dip;
+		p.rate_lo = rate_lo; p.rate_hi = rate_hi; p.max_run = max_run;
+		p.w_dur = w_dur; p.w_nuc = w_nuc; p.w_inner = w_inner; p.inner_ok = inner_ok;
+		p.w_break = w_break; p.break_ok = break_ok; p.w_skip = w_skip; p.c_skip = c_skip;
+		p.c_unplaced = c_unplaced; p.horizon = horizon;
+		return p;
+	}
+}
+
+class LyricAnchor(t0: double, t1: double, text: string, seq: int) { }
+
+class LyricAlignOut {
+	var placed = false;
+	var t0 = 0.0;
+	var t1 = 0.0;
+	var score = 0.0f;
+}
+
+// Minimal growable list.
+class Vec<T> {
+	var a: Array<T> = Array<T>.new(16);
+	var n = 0;
+	def add(x: T) -> this {
+		if (n == a.length) {
+			var na = Array<T>.new(a.length * 2);
+			for (i < n) na[i] = a[i];
+			a = na;
+		}
+		a[n++] = x;
+	}
+	def get(i: int) -> T { return a[i]; }
+	def last() -> T { return a[n - 1]; }
+	def set(i: int, x: T) { a[i] = x; }
+	def clear() { n = 0; }
+}
+
+def sortFloats(a: Array<float>, n: int) {	// heapsort, ascending
+	for (i = n / 2 - 1; i >= 0; i--) siftDown(a, i, n);
+	for (end = n - 1; end > 0; end--) {
+		var t = a[0]; a[0] = a[end]; a[end] = t;
+		siftDown(a, 0, end);
+	}
+}
+def siftDown(a: Array<float>, i: int, n: int) {
+	while (true) {
+		var c = 2 * i + 1;
+		if (c >= n) return;
+		if (c + 1 < n && a[c + 1] > a[c]) c++;
+		if (a[i] >= a[c]) return;
+		var t = a[i]; a[i] = a[c]; a[c] = t;
+		i = c;
+	}
+}
+def sortDoubles(a: Array<double>, n: int) {	// insertion sort (small arrays)
+	for (i = 1; i < n; i++) {
+		var x = a[i], j = i - 1;
+		while (j >= 0 && a[j] > x) { a[j + 1] = a[j]; j--; }
+		a[j + 1] = x;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Envelope
+// ---------------------------------------------------------------------------
+def lyric_activity(mono: Array<float>, frames: int, sr: int, out: LyricActivity) {
+	out.db = Array<float>.new(0);
+	out.floor_db = out.peak_db = -90.0f;
+	if (mono == null || frames == 0 || sr == 0) return;
+	var hop = int.truncd(sr * out.hop + 0.5);
+	var n_fr = frames / hop;
+
+	// One-pole high-pass at ~120 Hz drops rumble and stem bleed from the bass.
+	var a = DspMath.expf(-2.0f * float.roundd(DspMath.PI) * 120.0f / float.roundd(sr));
+	var prev_x = 0.0f, prev_y = 0.0f;
+	// Energy per 10 ms hop, then averaged over a 30 ms window.
+	var hop_e = Array<float>.new(n_fr);
+	for (f < n_fr) {
+		var acc = 0.0;
+		var base = f * hop;
+		for (k < hop) {
+			var xk = mono[base + k];
+			var y = a * (prev_y + xk - prev_x);
+			prev_x = xk; prev_y = y;
+			acc += double.!(y) * y;
+		}
+		hop_e[f] = float.roundd(acc / hop);
+	}
+	var db = out.db = Array<float>.new(n_fr);
+	for (f < n_fr) {
+		var s = hop_e[f], c = 1.0f;
+		if (f > 0) { s += hop_e[f - 1]; c += 1.0f; }
+		if (f + 1 < n_fr) { s += hop_e[f + 1]; c += 1.0f; }
+		db[f] = 10.0f * DspMath.log10f(s / c + 1e-10f);
+	}
+
+	var sorted = Array<float>.new(n_fr), ns = 0;
+	for (d in db) if (d > -95.0f) sorted[ns++] = d;
+	if (ns == 0) return;
+	sortFloats(sorted, ns);
+	out.floor_db = sorted[int.truncd(0.15 * (ns - 1))];
+	out.peak_db = sorted[int.truncd(0.98 * (ns - 1))];
+}
+
+// ---------------------------------------------------------------------------
+// Syllables
+// ---------------------------------------------------------------------------
+def is_vowel(c: byte) -> bool {
+	return c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u' || c == 'y';
+}
+def is_alpha(c: byte) -> bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+def is_digit(c: byte) -> bool { return c >= '0' && c <= '9'; }
+def is_space(c: byte) -> bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
+def to_lower(c: byte) -> byte { return if(c >= 'A' && c <= 'Z', byte.!(c + 32), c); }
+
+def word_syllables(text: string, w: int, len: int) -> int {
+	var b = Array<byte>.new(64);
+	var n = 0;
+	for (i = 0; i < len && n < 63; i++) {
+		var c = text[w + i];
+		if (is_alpha(c)) b[n++] = to_lower(c);
+	}
+	if (n == 0) {
+		for (i < len) if (is_digit(text[w + i])) return 2;	// "99"
+		return 0;
+	}
+	var groups = 0;
+	for (i < n) {
+		if (is_vowel(b[i]) && (i == 0 || !is_vowel(b[i - 1]))) groups++;
+	}
+	// Silent final e ("make", "love"), but not "-le" ("little") or "the".
+	if (n > 2 && b[n - 1] == 'e' && !is_vowel(b[n - 2]) &&
+		!(b[n - 2] == 'l' && !is_vowel(b[n - 3])) && groups > 1) groups--;
+	// "-ed" is silent unless after t/d ("walked" vs "wanted").
+	if (n > 3 && b[n - 2] == 'e' && b[n - 1] == 'd' && b[n - 3] != 't' && b[n - 3] != 'd' &&
+		!is_vowel(b[n - 3]) && groups > 1) groups--;
+	return if(groups < 1, 1, groups);
+}
+
+def is_word_sep(c: byte) -> bool { return is_space(c) || c == '-' || c == '/'; }
+
+def lyric_syllables(text: string) -> int {
+	var total = 0, p = 0;
+	while (p < text.length) {
+		while (p < text.length && is_word_sep(text[p])) p++;
+		var w = p;
+		while (p < text.length && !is_word_sep(text[p])) p++;
+		if (p > w) total += word_syllables(text, w, p - w);
+	}
+	return total;
+}
+
+// ---------------------------------------------------------------------------
+// Units
+// ---------------------------------------------------------------------------
+def max_in(v: Array<float>, a: int, b: int) -> float {
+	var m = -200.0f;
+	for (i = a; i < b; i++) if (v[i] > m) m = v[i];
+	return m;
+}
+
+// Split frames [a, b) at deep dips while longer than split_len.
+def split_run(act: LyricActivity, a: int, b: int, p: LyricAlignParams, cuts: Vec<(int, float)>) {
+	var hop = act.hop;
+	if ((b - a) * hop <= p.split_len) return;
+	var edge = int.truncd(0.25 / hop), side = int.truncd(0.4 / hop);
+	var best = -1, best_d = p.split_dip;
+	var db = act.db;
+	for (i = a + edge; i < b - edge; i++) {
+		var d = db[i];
+		if (d > db[i - 1] || d > db[i + 1]) continue;
+		var l0 = DspMath.imax(a, i - side), r1 = DspMath.imin(b, i + side + 1);
+		var depth = DspMath.fmin(max_in(db, l0, i), max_in(db, i + 1, r1)) - d;
+		if (depth > best_d) { best_d = depth; best = i; }
+	}
+	if (best < 0) return;
+	split_run(act, a, best, p, cuts);
+	cuts.add((best, best_d));
+	split_run(act, best, b, p, cuts);
+}
+
+def count_nuclei(act: LyricActivity, a: int, b: int) -> int {
+	var w = 8, reach = 15;	// a peak tops +-80 ms and rises 3 dB within 150 ms
+	var n = 0;
+	var db = act.db;
+	for (i = a; i < b; i++) {
+		var d = db[i];
+		var l = DspMath.imax(a, i - w), r = DspMath.imin(b, i + w + 1);
+		if (max_in(db, l, r) > d) continue;
+		if (i > a && db[i - 1] == d) continue;	// plateau: count once
+		var lmin = d, rmin = d;
+		for (k = DspMath.imax(a, i - reach); k < i; k++) lmin = DspMath.fmin(lmin, db[k]);
+		var rend = DspMath.imin(b, i + reach + 1);
+		for (k = i + 1; k < rend; k++) rmin = DspMath.fmin(rmin, db[k]);
+		if (i - reach < a) lmin = DspMath.fmin(lmin, d - 6.0f);	// unit edges count as low
+		if (i + reach >= b) rmin = DspMath.fmin(rmin, d - 6.0f);
+		if (d - lmin >= 3.0f && d - rmin >= 3.0f) n++;
+	}
+	return if(n < 1, 1, n);
+}
+
+def lyric_units(act: LyricActivity, t0: double, t1: double, p: LyricAlignParams, out: Vec<LyricUnit>) {
+	out.clear();
+	var nf = act.db.length;
+	if (nf == 0) return;
+	var f0 = DspMath.imax(0, int.truncd(t0 / act.hop)), f1 = DspMath.imin(nf, int.truncd(t1 / act.hop));
+	if (f1 - f0 < 2) return;
+	var on = DspMath.fmax(act.floor_db + p.on_frac * (act.peak_db - act.floor_db),
+		act.peak_db - p.max_below);
+	var off = on - 3.0f;
+
+	// Runs of singing, with hysteresis.
+	var runs = Vec<(int, int)>.new();
+	var inside = false, start = 0;
+	for (i = f0; i < f1; i++) {
+		var d = act.db[i];
+		if (!inside && d >= on) { inside = true; start = i; }
+		else if (inside && d < off) { inside = false; runs.add((start, i)); }
+	}
+	if (inside) runs.add((start, f1));
+
+	// Bridge short silences, drop blips.
+	var merged = Vec<(int, int)>.new();
+	var bridge = int.truncd(p.bridge_gap / act.hop);
+	for (ri < runs.n) {
+		var r = runs.a[ri];
+		if (merged.n > 0 && r.0 - merged.last().1 < bridge) merged.set(merged.n - 1, (merged.last().0, r.1));
+		else merged.add(r);
+	}
+	var min_len = int.truncd(p.min_unit / act.hop);
+	var prev_end = t0;
+	var cuts = Vec<(int, float)>.new();
+	for (mi < merged.n) {
+		var r = merged.a[mi];
+		if (r.1 - r.0 < min_len) continue;
+		cuts.clear();
+		split_run(act, r.0, r.1, p, cuts);
+		var a = r.0;
+		for (c = 0; c <= cuts.n; c++) {
+			var b = if(c < cuts.n, cuts.a[c].0, r.1);
+			var u = LyricUnit.new();
+			u.t0 = a * act.hop;
+			u.t1 = b * act.hop;
+			u.gap_before = if(c == 0, DspMath.dmin(5.0, u.t0 - prev_end), 0.0);
+			u.dip_before = if(c == 0, 0.0f, cuts.a[c - 1].1);
+			u.nuclei = count_nuclei(act, a, b);
+			out.add(u);
+			a = b;
+		}
+		prev_end = r.1 * act.hop;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Alignment
+// ---------------------------------------------------------------------------
+class Ctx {
+	var u: Array<LyricUnit>;
+	var next_bar: Array<int>;	// first unit after j that follows an anchor
+	var bs: Array<double>;		// boundary strength before unit k, seconds
+	var inner: Array<double>;	// prefix: inner-pause penalty of boundaries < k
+	var nuc: Array<int>;		// prefix: nuclei of units < k
+	var syl: Array<int>;
+	var p: LyricAlignParams;
+}
+
+def line_cost(c: Ctx, i: int, j: int, k: int, rate: double) -> double {
+	var p = c.p;
+	var u = c.u;
+	var span = u[k - 1].t1 - u[j].t0;
+	var syl = double.!(c.syl[i]);
+	var e = syl * rate;
+	var lr = DspMath.log(span / e);
+	var cost = p.w_dur * lr * lr;
+	var nr = DspMath.log((c.nuc[k] - c.nuc[j] + 1.0) / (syl + 1.0));
+	cost += p.w_nuc * nr * nr;
+	cost += p.w_inner * (c.inner[k] - c.inner[j + 1]);
+	if (j > 0) cost += p.w_break * DspMath.dmax(0.0, p.break_ok - c.bs[j]);
+	return cost;
+}
+
+class Solve {
+	var total: double;
+	var first: Array<int>;
+	var last: Array<int>;
+	var cost: Array<double>;
+}
+
+def INF = 1e30;
+def dabs(x: double) -> double { return if(x < 0.0, -x, x); }
+
+// Lines i0 .. i0+n-1 on units u0 .. m-1.  open_end: the window need not use
+// up the units.  A line never spans an anchor.
+def solve(c: Ctx, i0: int, n: int, u0: int, m: int, rate: double, open_end: bool) -> Solve {
+	var p = c.p;
+	var u = c.u;
+	var W = m + 1;
+	var D = Array<double>.new((n + 1) * W);
+	var B = Array<int>.new((n + 1) * W);	// >=0: line ran from unit B; -2: skip
+	for (x < D.length) { D[x] = INF; B[x] = -1; }
+	D[u0] = 0.0;
+	for (i = 0; i <= n; i++) {
+		for (j = u0; j <= m; j++) {
+			var d = D[i * W + j];
+			if (d >= INF) continue;
+			if (j < m) {
+				var s = d + p.w_skip * (u[j].t1 - u[j].t0) + p.c_skip;
+				var idx = i * W + j + 1;
+				if (s < D[idx]) { D[idx] = s; B[idx] = -2; }
+			}
+			if (i < n) {
+				var kmax = DspMath.imin(DspMath.imin(m, j + p.max_run), c.next_bar[j]);
+				for (k = j + 1; k <= kmax; k++) {
+					var s = d + line_cost(c, i0 + i, j, k, rate);
+					var idx = (i + 1) * W + k;
+					if (s < D[idx]) { D[idx] = s; B[idx] = j; }
+				}
+			}
+		}
+	}
+	var r = Solve.new();
+	r.first = Array<int>.new(n); r.last = Array<int>.new(n); r.cost = Array<double>.new(n);
+	for (x < n) { r.first[x] = -1; r.last[x] = -1; }
+	var best_i = 0, best_j = m, best = INF;
+	for (i = 0; i <= n; i++) {
+		var s = D[i * W + m] + p.c_unplaced * float.!(n - i);
+		if (s < best) { best = s; best_i = i; best_j = m; }
+	}
+	if (open_end) {
+		for (j = u0; j <= m; j++) {
+			if (D[n * W + j] < best) { best = D[n * W + j]; best_i = n; best_j = j; }
+		}
+	}
+	r.total = best;
+	var i = best_i, j = best_j;
+	while (i > 0 || j > u0) {
+		var b = B[i * W + j];
+		if (b == -2) { j--; continue; }
+		if (b < 0) break;
+		r.first[i - 1] = b; r.last[i - 1] = j - 1;
+		r.cost[i - 1] = line_cost(c, i0 + i - 1, b, j, rate);
+		i--; j = b;
+	}
+	return r;
+}
+
+// Cut the anchors' spans out of the units.  barrier[k] is set when an
+// anchor sits between unit k-1 and unit k.
+class Carver(act: LyricActivity, anchors: Array<LyricAnchor>, p: LyricAlignParams,
+		out: Vec<LyricUnit>, barrier: Vec<bool>) {
+	var prev_end = -1e9;
+	def emit(u: LyricUnit, cut: bool) {
+		if (u.t1 - u.t0 < p.min_unit) return;
+		var bar = false;
+		for (a in anchors) {
+			var mid = 0.5 * (a.t0 + a.t1);
+			if (mid >= prev_end && mid <= u.t0 + 1e-9) { bar = true; break; }
+		}
+		if (cut) {
+			var f0 = int.truncd(u.t0 / act.hop), f1 = int.truncd(u.t1 / act.hop);
+			u.nuclei = if(f1 > f0, count_nuclei(act, f0, f1), 1);
+		}
+		if (bar) { u.gap_before = DspMath.dmax(u.gap_before, 1.0); u.dip_before = 0.0f; }
+		out.add(u);
+		barrier.add(bar);
+		prev_end = u.t1;
+	}
+}
+
+def carve_anchors(act: LyricActivity, input: Vec<LyricUnit>, anchors: Array<LyricAnchor>,
+		p: LyricAlignParams, out: Vec<LyricUnit>, barrier: Vec<bool>) {
+	out.clear(); barrier.clear();
+	var cv = Carver.new(act, anchors, p, out, barrier);
+	for (ui < input.n) {
+		var u = input.a[ui].copy();
+		var cut = false;
+		// Anchors are sorted by start: peel them off the unit left to right.
+		for (a in anchors) {
+			if (a.t1 <= u.t0 || a.t0 >= u.t1) continue;
+			if (a.t0 > u.t0) {
+				var l = u.copy(); l.t1 = a.t0;
+				cv.emit(l, true);
+			}
+			u.t0 = a.t1;
+			u.gap_before = 0.0; u.dip_before = 0.0f;
+			cut = true;
+			if (u.t0 >= u.t1) break;
+		}
+		if (u.t0 < u.t1) cv.emit(u, cut);
+	}
+}
+
+// Units of one stretch of the track, carved around the anchors, with the
+// DP's precomputed sums.
+class Pass {
+	var units = Vec<LyricUnit>.new();
+	var barrier = Vec<bool>.new();
+	var c = Ctx.new();
+}
+
+def build_pass(act: LyricActivity, t0: double, t1: double, anchors: Array<LyricAnchor>,
+		p: LyricAlignParams, syl: Array<int>, ps: Pass) {
+	var raw = Vec<LyricUnit>.new();
+	lyric_units(act, t0, t1, p, raw);
+	carve_anchors(act, raw, anchors, p, ps.units, ps.barrier);
+	var m = ps.units.n;
+	var c = ps.c;
+	c.u = ps.units.a; c.syl = syl; c.p = p;
+	c.bs = Array<double>.new(m);
+	c.inner = Array<double>.new(m + 1);
+	c.nuc = Array<int>.new(m + 1);
+	c.next_bar = Array<int>.new(m + 1);
+	for (k < m + 1) c.next_bar[k] = m;
+	for (k < m) {
+		var uk = ps.units.a[k];
+		c.bs[k] = uk.gap_before + uk.dip_before / 40.0;
+		var pen = if(k > 0, DspMath.dmax(0.0, c.bs[k] - p.inner_ok), 0.0);
+		c.inner[k + 1] = c.inner[k] + pen;
+		c.nuc[k + 1] = c.nuc[k] + uk.nuclei;
+	}
+	// inner[k] - inner[j+1] sums the boundaries before units j+1 .. k-1.
+	for (k = m - 1; k >= 0; k--) {
+		c.next_bar[k] = if(k + 1 < m && ps.barrier.a[k + 1], k + 1, c.next_bar[k + 1]);
+	}
+}
+
+// Mutable alignment state shared across windows (rate fitted once).
+class AlignState {
+	var rate: double;
+	var fit = true;
+	var t_end: double;
+}
+
+// Lines [i_lo, i_hi) on the pass's units, a window at a time.
+// Returns the first line not placed.
+def run_windows(ps: Pass, i_lo: int, i_hi: int, p: LyricAlignParams, rates: Array<double>,
+		st: AlignState, out: Array<LyricAlignOut>) -> int {
+	var m = ps.units.n;
+	var H = if(p.horizon > 0, p.horizon, i_hi - i_lo);
+	var i0 = i_lo, u0 = 0;
+	var one = [0.0];
+	while (i0 < i_hi && u0 < m) {
+		var len = DspMath.imin(H, i_hi - i0);
+		var last = (i0 + len == i_hi);
+		var best: Solve = null, best_total = 1e30;
+		var rs = rates;
+		if (!st.fit) { one[0] = st.rate; rs = one; }
+		for (r in rs) {
+			var s = solve(ps.c, i0, len, u0, m, r, !last);
+			if (s.total < best_total) { best = s; best_total = s.total; st.rate = r; }
+		}
+		st.fit = false;
+		if (best == null) break;
+		var keep = if(last, len, DspMath.imax(1, len / 2));
+		var next_u = -1, placed_upto = i0;
+		for (i < keep) {
+			if (best.first[i] < 0) continue;
+			var o = out[i0 + i];
+			o.placed = true;
+			o.t0 = ps.units.a[best.first[i]].t0;
+			o.t1 = ps.units.a[best.last[i]].t1;
+			o.score = float.roundd(DspMath.exp(-best.cost[i]));
+			next_u = best.last[i] + 1;
+			placed_upto = i0 + i + 1;
+			st.t_end = o.t1;
+		}
+		if (next_u < 0) break;	// nothing fit: out of singing
+		i0 = placed_upto;
+		if (last) break;
+		u0 = next_u;
+	}
+	return i0;
+}
+
+class Gap(i_lo: int, i_hi: int, ta: double, tb: double) { }
+
+def RELAX = [0.0f, 20.0f, 30.0f];
+
+def lyric_align(act: LyricActivity, t0: double, t1: double, lines: Array<string>,
+		anchors_in: Array<LyricAnchor>, p: LyricAlignParams, out: Array<LyricAlignOut>) -> double {
+	var n = lines.length;
+	for (i < n) out[i] = LyricAlignOut.new();
+	if (n == 0) return 0.0;
+	var anchors = Array<LyricAnchor>.new(anchors_in.length);
+	for (i < anchors.length) anchors[i] = anchors_in[i];
+	for (i = 1; i < anchors.length; i++) {	// stable insertion sort by t0
+		var x = anchors[i], j = i - 1;
+		while (j >= 0 && anchors[j].t0 > x.t0) { anchors[j + 1] = anchors[j]; j--; }
+		anchors[j + 1] = x;
+	}
+
+	var syl = Array<int>.new(n);
+	for (i < n) syl[i] = DspMath.imax(1, lyric_syllables(lines[i]));
+
+	// Singing rate: from the placed lines when there are enough, else searched.
+	var rates: Array<double>;
+	var anchor_rates = Array<double>.new(anchors.length), nar = 0;
+	for (a in anchors) {
+		var s = lyric_syllables(if(a.text != null, a.text, ""));
+		if (s >= 2 && a.t1 > a.t0) anchor_rates[nar++] = (a.t1 - a.t0) / s;
+	}
+	if (nar >= 3) {
+		sortDoubles(anchor_rates, nar);
+		var rc = anchor_rates[nar / 2];
+		rates = Array<double>.new(5);
+		for (g = -2; g <= 2; g++) rates[g + 2] = rc * DspMath.pow(1.12, g);
+	} else {
+		var G = 12;
+		rates = Array<double>.new(G);
+		for (g < G) rates[g] = p.rate_lo * DspMath.pow(p.rate_hi / p.rate_lo, g / double.!(G - 1));
+	}
+
+	// Gaps between anchors whose place in the sheet is known.
+	var gaps = Vec<Gap>.new();
+	{
+		var i_prev = 0, t_prev = t0;
+		for (a in anchors) {
+			if (a.seq < i_prev || a.seq > n) continue;
+			var mid = 0.5 * (a.t0 + a.t1);
+			gaps.add(Gap.new(i_prev, a.seq, t_prev, mid));
+			i_prev = a.seq; t_prev = mid;
+		}
+		gaps.add(Gap.new(i_prev, n, t_prev, t1));
+	}
+
+	var st = AlignState.new();
+	st.rate = rates[0];
+	for (gi < gaps.n) {
+		var g = gaps.a[gi];
+		var i0 = g.i_lo;
+		var ta = g.ta;
+		for (relax in RELAX) {
+			if (i0 >= g.i_hi || ta >= g.tb) break;
+			var pr = p.copy();
+			if (relax > 0.0f) {
+				if (relax <= p.max_below) continue;
+				pr.max_below = relax;
+			}
+			var ps = Pass.new();
+			build_pass(act, ta, g.tb, anchors, pr, syl, ps);
+			if (ps.units.n == 0) continue;
+			st.t_end = ta;
+			i0 = run_windows(ps, i0, g.i_hi, pr, rates, st, out);
+			ta = st.t_end;
+		}
+		// Still left over: one after another at the singing rate.
+		var t = ta + 0.3;
+		while (i0 < g.i_hi) {
+			var len = DspMath.dmax(1.0, syl[i0] * st.rate);
+			if (t + len > g.tb) break;
+			var o = out[i0];
+			o.placed = true;
+			o.t0 = t; o.t1 = t + len;
+			o.score = 0.05f;
+			t += len + 0.3;
+			i0++;
+		}
+	}
+	return st.rate;
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic vocal track
+// ---------------------------------------------------------------------------
+def LYRICS = [
+	"Walking down the empty road tonight",
+	"Every window burning with a light",
+	"I remember how you used to sing",
+	"Little voices calling out in spring",
+	"Hold on",
+	"Hold on to the morning when it comes",
+	"We were running wild beneath the summer sun",
+	"Never looking back",
+	"Carry me home",
+	"Over the water and under the stars",
+	"Wanted to tell you who we are",
+	"Oh the river keeps on rolling by",
+	"Ninety nine reasons and a lullaby",
+	"Somewhere a radio is playing our song",
+	"Dancing alone",
+	"All night long"
+];
+
+// One pass through the lyric sheet (16 lines, ~52 s), synthesized at COMPILE
+// time: Virgil runs top-level initializers in the compiler and bakes the
+// result into the binary, so input generation is not part of the timed run.
+def QUIET = 5;
+def CLIP = VocalSynth.new().generate(LYRICS.length);
+
+// The song: the clip tiled to {nl} lines, ending 1 s after the last line.
+class Song {
+	var sr: int;
+	var mono: Array<float>;
+	var frames: int;
+	var lines: Array<string>;
+	var starts: Array<double>;	// ground truth line starts
+	var ends: Array<double>;
+	var syllables: int;		// sung in the lines (ad-libs not counted)
+	new(clip: VocalSynth, nl: int) {
+		sr = clip.sr;
+		var NC = clip.lines.length, L = clip.frames;
+		lines = Array<string>.new(nl);
+		starts = Array<double>.new(nl);
+		ends = Array<double>.new(nl);
+		for (i < nl) {
+			var ci = i % NC;
+			var off = double.!((i / NC) * L) / sr;
+			lines[i] = clip.lines[ci];
+			starts[i] = clip.starts[ci] + off;
+			ends[i] = clip.ends[ci] + off;
+			syllables += lyric_syllables(lines[i]);
+		}
+		var last = nl - 1;
+		frames = (last / NC) * L + DspMath.imin(L, int.truncd((clip.ends[last % NC] + 1.0) * sr));
+		mono = Array<float>.new(frames);
+		for (base = 0; base < frames; base += L) {
+			var n = DspMath.imin(L, frames - base);
+			for (k < n) mono[base + k] = clip.mono[k];
+		}
+		// A quiet last chorus: the last QUIET lines sit 12 dB down, under the
+		// loudness threshold, so they are found only by the relaxed passes.
+		for (i = int.truncd(starts[nl - QUIET] * sr) - 1; i < frames; i++) mono[i] *= 0.25f;
+	}
+}
+
+class VocalSynth {
+	var sr = 8000;
+	var seed = 4242u;
+	var mono: Array<float>;
+	var frames: int;
+	var lines: Array<string>;
+	var starts: Array<double>;	// ground truth line starts
+	var ends: Array<double>;
+
+	def rand() -> double {	// uniform in [0, 1)
+		seed = seed * 1664525u + 1013904223u;
+		return double.!(seed >> 8) / 16777216.0;
+	}
+	// Sing the syllables of {words} starting at time t; returns the end time.
+	// Pure arithmetic (no libm) so the C++ reference generates identical samples:
+	// a triangle-wave tone with an octave partial, one parabolic loudness bump
+	// per syllable.
+	def sing(buf: Array<float>, t: double, words: Array<int>, amp: double, f0: double, rate: double) -> double {
+		var srd = double.!(sr);
+		var dph = f0 / srd;
+		for (wi < words.length) {
+			for (s < words[wi]) {
+				var dur = rate * (0.8 + 0.4 * rand());
+				var s0 = int.truncd(t * srd), s1 = int.truncd((t + dur) * srd);
+				if (s1 > buf.length) s1 = buf.length;
+				var n = s1 - s0;
+				var ph = 0.0, ph2 = 0.25;
+				for (k < n) {
+					var x = double.!(k) / double.!(n);
+					var bump = 4.0 * x * (1.0 - x);
+					var env = 0.35 + 0.65 * bump * bump;
+					var tri = 4.0 * dabs(ph - 0.5) - 1.0;
+					var tri2 = 4.0 * dabs(ph2 - 0.5) - 1.0;
+					buf[s0 + k] += float.roundd(amp * env * (tri + 0.4 * tri2));
+					ph += dph; if (ph >= 1.0) ph -= 1.0;
+					ph2 += 2.0 * dph; if (ph2 >= 1.0) ph2 -= 1.0;
+				}
+				t += dur;
+			}
+		}
+		return t;
+	}
+	def wordSyllables(text: string) -> Array<int> {
+		var v = Vec<int>.new(), p = 0;
+		while (p < text.length) {
+			while (p < text.length && is_word_sep(text[p])) p++;
+			var w = p;
+			while (p < text.length && !is_word_sep(text[p])) p++;
+			if (p > w) v.add(DspMath.imax(1, word_syllables(text, w, p - w)));
+		}
+		var r = Array<int>.new(v.n);
+		for (i < v.n) r[i] = v.a[i];
+		return r;
+	}
+	def generate(nl: int) -> this {
+		lines = Array<string>.new(nl);
+		starts = Array<double>.new(nl);
+		ends = Array<double>.new(nl);
+		var words = Array<Array<int>>.new(LYRICS.length);
+		for (i < LYRICS.length) words[i] = wordSyllables(LYRICS[i]);
+		var total = 0;
+		for (i < nl) for (x in words[i % LYRICS.length]) total += x;
+		var est = 3.0 + total * 0.33 + nl * 2.2;
+		var buf = Array<float>.new(int.truncd(est * sr));
+		var t = 1.5;
+		var rate = 0.24;
+		for (i < nl) {
+			var li = i % LYRICS.length;
+			lines[i] = LYRICS[li];
+			var amp = 0.25 + 0.15 * rand();
+			var f0 = 160.0 + 140.0 * rand();
+			starts[i] = t;
+			t = sing(buf, t, words[li], amp, f0, rate * (0.9 + 0.2 * rand()));
+			ends[i] = t;
+			var pause = 0.6 + 0.8 * rand();
+			if (i % 7 == 6) {	// an ad-lib ("oh") in a longer pause
+				var t2 = sing(buf, t + 0.65, [1], amp * 0.6, f0 * 1.5, 0.3);
+				t = t2 + 0.65;
+			} else {
+				t += pause;
+			}
+		}
+		frames = int.truncd(t * sr);	// the clip ends after the last pause
+		if (frames > buf.length) frames = buf.length;
+		mono = Array<float>.new(frames);
+		for (i < frames) mono[i] = buf[i] + float.roundd(0.002 * (rand() - 0.5));
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+def main(args: Array<string>) -> int {
+	// args: <lines> [<anchors 0..3>]
+	var nlines = Util.intArg(args, 32);
+	var nanchors = if(args.length > 1, Int.parse(args[1]), 3);
+	if (nanchors < 0) nanchors = 0;
+	if (nanchors > 3) nanchors = 3;
+	var allAnchors = [2, 7, 12];
+	var minLines = DspMath.imax(QUIET + 3, if(nanchors > 0, allAnchors[nanchors - 1] + 1, 0));
+	if (nlines < minLines) nlines = minLines;
+	var syn = Song.new(CLIP, nlines);
+	var act = LyricActivity.new();
+	lyric_activity(syn.mono, syn.frames, syn.sr, act);
+
+	// Up to three lines of the first verse are already placed (anchors, known
+	// sheet position); the rest are to be aligned.  With fewer than three the
+	// singing rate is searched over a grid instead of taken from the anchors.
+	var anchorIdx = Array<int>.new(nanchors);
+	for (k < nanchors) anchorIdx[k] = allAnchors[k];
+	var nl = syn.lines.length;
+	var isAnchor = Array<bool>.new(nl);
+	var anchors = Array<LyricAnchor>.new(anchorIdx.length);
+	for (k < anchorIdx.length) {
+		var li = anchorIdx[k];
+		isAnchor[li] = true;
+		anchors[k] = LyricAnchor.new(syn.starts[li], syn.ends[li], syn.lines[li], li - k);
+	}
+	var lines = Array<string>.new(nl - anchorIdx.length);
+	var truth = Array<double>.new(lines.length);
+	var j = 0;
+	for (i < nl) {
+		if (isAnchor[i]) continue;
+		lines[j] = syn.lines[i]; truth[j] = syn.starts[i]; j++;
+	}
+
+	var p = LyricAlignParams.new();
+	var out = Array<LyricAlignOut>.new(lines.length);
+	var duration = double.!(syn.frames) / syn.sr;
+	var rate = lyric_align(act, 0.0, duration, lines, anchors, p, out);
+
+	DspOut.label("frames"); DspOut.putl(act.db.length);
+	DspOut.label(" floor"); DspOut.putf(act.floor_db, 2);
+	DspOut.label(" peak"); DspOut.putf(act.peak_db, 2);
+	System.ln();
+	// All the singing, quiet chorus included (the relaxed threshold).
+	var pr = p.copy();
+	pr.max_below = 20.0f;
+	var units = Vec<LyricUnit>.new();
+	lyric_units(act, 0.0, duration, pr, units);
+	var nuc = 0, uh = 0;
+	for (i < units.n) {
+		var u = units.a[i];
+		nuc += u.nuclei;
+		uh = uh * 31 + int.truncd(double.round(u.t0 * 100.0));
+		uh = uh * 31 + int.truncd(double.round(u.t1 * 100.0));
+		uh = uh * 31 + u.nuclei;
+		uh = uh * 31 + int.truncd(double.round(u.dip_before * 10.0));
+	}
+	DspOut.label("envelope checksum"); DspOut.putl(DspOut.checksum(act.db, 0, act.db.length));
+	System.ln();
+	DspOut.label("units"); DspOut.putl(units.n);
+	DspOut.label(" nuclei"); DspOut.putl(nuc);
+	DspOut.label(" hash"); DspOut.putl(uh);
+	DspOut.label(" rate"); DspOut.putd(rate, 4);
+	System.ln();
+
+	var verbose = lines.length <= 64;
+	var placed = 0, close = 0, sumScore = 0.0, ph = 0;
+	for (i < lines.length) {
+		var o = out[i];
+		var ok = o.placed && dabs(o.t0 - truth[i]) <= 0.5;
+		if (o.placed) {
+			placed++; sumScore += o.score;
+			ph = ph * 31 + int.truncd(double.round(o.t0 * 100.0));
+			ph = ph * 31 + int.truncd(double.round(o.t1 * 100.0));
+		}
+		if (ok) close++;
+		if (verbose) {
+			DspOut.putl(i);
+			System.puts(" syl=");
+			DspOut.putl(lyric_syllables(lines[i]));
+			System.puts(" truth=");
+			DspOut.putd(truth[i], 2);
+			if (o.placed) {
+				System.puts(" t0=");
+				DspOut.putd(o.t0, 2);
+				System.puts(" t1=");
+				DspOut.putd(o.t1, 2);
+				System.puts(" score=");
+				DspOut.putf(o.score, 3);
+			} else {
+				System.puts(" unplaced");
+			}
+			if (ok) System.puts(" ok");
+			System.ln();
+		}
+	}
+	DspOut.label("lines"); DspOut.putl(lines.length);
+	DspOut.label(" placed"); DspOut.putl(placed);
+	DspOut.label(" within0.5s"); DspOut.putl(close);
+	DspOut.label(" meanScore"); DspOut.putd(if(placed > 0, sumScore / placed, 0.0), 4);
+	DspOut.label(" hash"); DspOut.putl(ph);
+	System.ln();
+
+	// Correctness checks against the ground truth of the synthetic track.
+	var inOrder = true, clearOfAnchors = true;
+	var prevEnd = -1.0;
+	for (i < lines.length) {
+		var o = out[i];
+		if (!o.placed) continue;
+		if (o.t0 < prevEnd - 1e-9 || o.t1 <= o.t0) inOrder = false;
+		prevEnd = o.t1;
+		for (a in anchors) if (o.t0 < a.t1 - 1e-9 && o.t1 > a.t0 + 1e-9) clearOfAnchors = false;
+	}
+	DspOut.label("syllables"); DspOut.putl(syn.syllables);
+	System.ln();
+	check("all lines placed", placed == lines.length);
+	// The quiet last chorus is reported but not checked: the original
+	// algorithm usually lands those lines one phrase early (the window before
+	// it squeezes a line into the end of the loud singing, and the relaxed pass
+	// then places the rest one phrase off).
+	var quietT = syn.starts[syn.lines.length - QUIET] - 0.01;
+	var loud = 0, loudOk = 0, quiet = 0, quietOk = 0;
+	for (i < lines.length) {
+		var ok = out[i].placed && dabs(out[i].t0 - truth[i]) <= 0.5;
+		if (truth[i] < quietT) { loud++; if (ok) loudOk++; }
+		else { quiet++; if (ok) quietOk++; }
+	}
+	DspOut.label("loud lines ok"); DspOut.putl(loudOk); System.puts("/"); DspOut.putl(loud);
+	DspOut.label(" quiet lines ok"); DspOut.putl(quietOk); System.puts("/"); DspOut.putl(quiet);
+	System.ln();
+	check("lines before the quiet chorus starting within 0.5 s of truth >= 85%", loudOk * 100 >= loud * 85);
+
+	check("placements in sheet order, non-overlapping", inOrder);
+	check("no line placed over an anchor", clearOfAnchors);
+	check("syllable nuclei within 15% of sung syllables",
+		nuc * 100 >= syn.syllables * 85 && nuc * 100 <= syn.syllables * 115);
+	check("singing rate within 15% of the synthesized 0.24 s", dabs(rate - 0.24) <= 0.036);
+	return if(failures > 0, 1, 0);
+}
+
+var failures = 0;
+def check(what: string, ok: bool) {
+	System.puts("check ");
+	System.puts(what);
+	System.puts(if(ok, ": PASS", ": FAIL"));
+	System.ln();
+	if (!ok) failures++;
+}

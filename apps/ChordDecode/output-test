@@ -1,0 +1,17 @@
+beats: 120
+mapped chords: 12
+chroma: 1603655294
+chroma sum: 542.148
+key (KS): C
+warm: models=24 beats=24..119 correct=95/95
+  models: 898136620 transition=0.0500 decoded=1774
+  score sum: 1675.088 path hash: -1061787717
+  chart: C/2 Am/2 F/2 G/2 Dm/2 Em/2 C/2 Am/2 F/2 G/2 Dm/2 Em/2 (48 runs)
+cold: models=24 beats=0..119 correct=119/119
+  models: -15468544 transition=0.1000 decoded=2254
+  score sum: 1517.670 path hash: -68046691
+  chart: C/2 Am/2 F/2 G/2 Dm/2 Em/2 C/2 Am/2 F/2 G/2 Dm/2 Em/2 (60 runs)
+check warm models learned from mapped chords: PASS
+check key estimate (Krumhansl-Schmuckler) is C major: PASS
+check warm decode accuracy >= 95% (95/95): PASS
+check cold decode accuracy >= 90% (119/119): PASS

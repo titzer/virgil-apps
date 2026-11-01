@@ -1,0 +1,24 @@
+input frames: 6615, rms 0.19212 0.17079
+speed 1.00 pitch 1.0000: frames 6615 (expect 6615.0), rms 0.19212 0.17079, shift 0 cents, checksum -1361909392
+  check length within 1 frame of input/speed: PASS
+  check rms within 10% of input (both channels): PASS
+  check spectral shift within 10 cents of pitch: PASS
+  check identity length exact: PASS
+  check identity max abs error < 1e-4: PASS
+  check identity transparency SNR > 80 dB: PASS
+speed 0.75 pitch 1.0000: frames 8820 (expect 8820.0), rms 0.18376 0.16335, shift 0 cents, checksum 1834994294
+  check length within 1 frame of input/speed: PASS
+  check rms within 10% of input (both channels): PASS
+  check spectral shift within 10 cents of pitch: PASS
+speed 1.25 pitch 1.0000: frames 5292 (expect 5292.0), rms 0.18613 0.16546, shift 0 cents, checksum 867646418
+  check length within 1 frame of input/speed: PASS
+  check rms within 10% of input (both channels): PASS
+  check spectral shift within 10 cents of pitch: PASS
+speed 1.00 pitch 1.1892: frames 6616 (expect 6615.0), rms 0.18442 0.16394, shift 300 cents, checksum -1588114194
+  check length within 1 frame of input/speed: PASS
+  check rms within 10% of input (both channels): PASS
+  check spectral shift within 10 cents of pitch: PASS
+speed 0.80 pitch 0.7500: frames 8269 (expect 8268.7), rms 0.18946 0.16841, shift -500 cents, checksum -1221756653
+  check length within 1 frame of input/speed: PASS
+  check rms within 10% of input (both channels): PASS
+  check spectral shift within 10 cents of pitch: PASS

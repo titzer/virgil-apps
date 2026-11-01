@@ -1,0 +1,617 @@
+// Copyright 2026 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Port of beatmapper's beat-synchronous chord decoder (src/complete_algo.cpp:
+// triad_template, parse_chord, build_chord_models, corpus_chord_probs with the
+// weights of src/chord_model.h, estimate_key, decode_chords).  Its input is one
+// chroma vector per beat interval, computed by beat_chroma_interval
+// (src/beat_chroma.cpp) with the Goertzel/Hann chroma (src/chroma_goertzel.cpp).
+//
+// Driver (a plain-array version of chords_from_models): the first two cycles
+// of the synthetic song's progression are "mapped" chords taken from ground
+// truth; the decoder then labels
+//   warm: the unmapped beats, with models learned from the mapped chords
+//         (plus unseen triads, penalised), change cost scaled by the median
+//         mapped chord length;
+//   cold: every beat with no map at all: 24 unseen triads, the corpus-trained
+//         emission model blended in, and a Krumhansl-Schmuckler key bonus.
+// The decoder is cheap relative to chroma, so each decode is repeated <reps>
+// times over shifted stretches.
+// Args: <clip.wav> <seconds> <reps> [t]; the clip is tiled to the song length,
+// and a 4th argument prints the time split between loading, chroma and decoding.
+
+class AudioPcm(pcm: Array<float>, frameCount: int, channels: int, sampleRate: int) { }
+
+// CompleteParams (chord fields, complete_params_defaults).
+class ChordParams {
+	var transition = 0.10f;
+	var measureBonus = 0.75f;
+	var unseenPenalty = 0.10f;
+	var priorBeats = 4.0f;
+	var learnRate = true;
+	var corpusWeight = 0.0f;
+	var corpusWeightCold = 0.2f;
+	var keyBonus = 0.05f;
+	def copy() -> ChordParams {
+		var p = ChordParams.new();
+		p.transition = transition; p.measureBonus = measureBonus; p.unseenPenalty = unseenPenalty;
+		p.priorBeats = priorBeats; p.learnRate = learnRate; p.corpusWeight = corpusWeight;
+		p.corpusWeightCold = corpusWeightCold; p.keyBonus = keyBonus;
+		return p;
+	}
+}
+
+// A lane of chord annotations (MiscMap) over a beat map.
+class ChordMap(tStart: Array<double>, tEnd: Array<double>, text: Array<string>) {
+	def count() -> int { return tStart.length; }
+}
+
+class ChordModel(text: string) {
+	def v = Array<float>.new(12);
+	var n = 0;
+	var seen = false;
+}
+
+def PIF = 3.14159265358979f;
+
+//==========================================================================
+// Goertzel / Hann chroma (chroma_goertzel.cpp)
+//==========================================================================
+def GOERTZEL_N = 4096;
+def gTarget = Array<float>.new(60);	// [pc * 5 + octave_index], octaves 2..6
+def gWin = Array<float>.new(GOERTZEL_N);
+def gMono = Array<float>.new(GOERTZEL_N);
+var gInit = false;
+
+def ensureTargets() {
+	if (gInit) return;
+	for (pc < 12) for (oi < 5) {
+		var oct = oi + 2;
+		var midi = 12 * (oct + 1) + pc;
+		gTarget[pc * 5 + oi] = 440.0f * DspMath.powf(2.0f, float.!(midi - 69) / 12.0f);
+	}
+	for (i < GOERTZEL_N) gWin[i] = 0.5f * (1.0f - DspMath.cosf(2.0f * PIF * float.!(i) / float.!(GOERTZEL_N - 1)));
+	gInit = true;
+}
+
+def goertzel(mono: Array<float>, win: Array<float>, N: int, freq: float, sr: float) -> float {
+	var w = 2.0f * PIF * freq / sr;
+	var coeff = 2.0f * DspMath.cosf(w);
+	var s1 = 0.0f, s2 = 0.0f;
+	for (i < N) {
+		var s0 = mono[i] * win[i] + coeff * s1 - s2;
+		s2 = s1; s1 = s0;
+	}
+	return s1 * s1 + s2 * s2 - coeff * s1 * s2;
+}
+
+def chromaGoertzelHann(a: AudioPcm, t0: double, t1: double, result: Array<float>) {
+	for (i < 12) result[i] = 0.0f;
+	ensureTargets();
+	var ch = a.channels, sr = a.sampleRate, pcm = a.pcm;
+	if (a.frameCount == 0 || ch == 0 || sr == 0) return;
+	if (t1 - t0 > 8.0) t0 = t1 - 8.0;
+	var fs = int.truncd(t0 * sr); if (fs < 0) fs = 0;
+	var fe = int.truncd(t1 * sr); if (fe > a.frameCount) fe = a.frameCount;
+	if (fe - fs < GOERTZEL_N) return;
+
+	var power = Array<double>.new(12);
+	var chf = float.!(ch), srf = float.!(sr);
+	for (pos = fs; pos + GOERTZEL_N <= fe; pos += GOERTZEL_N) {
+		for (i < GOERTZEL_N) {
+			var s = 0.0f;
+			for (c < ch) s += pcm[(pos + i) * ch + c];
+			gMono[i] = s / chf;
+		}
+		for (pc < 12) for (oi < 5) power[pc] += goertzel(gMono, gWin, GOERTZEL_N, gTarget[pc * 5 + oi], srf);
+	}
+	// Normalise: peak -> 0 dB, -30 dB floor -> 0.
+	var mx = 1e-30;
+	for (i < 12) if (power[i] > mx) mx = power[i];
+	for (i < 12) {
+		var db = 10.0f * DspMath.log10f(float.roundd(power[i] / mx) + 1e-30f);
+		var v = (db + 30.0f) / 30.0f;
+		result[i] = if(v < 0.0f, 0.0f, if(v > 1.0f, 1.0f, v));
+	}
+}
+
+// beat_chroma_interval: skip the attack at the start of the beat.
+def ATTACK_MS = 60.0f;
+def ATTACK_FRAC = 0.15f;
+def beatChromaInterval(a: AudioPcm, t0: double, t1: double, out: Array<float>) {
+	for (i < 12) out[i] = 0.0f;
+	if (t1 <= t0) return;
+	var len = t1 - t0;
+	var skip = double.!(ATTACK_MS) * 0.001;
+	if (ATTACK_FRAC * len > skip) skip = ATTACK_FRAC * len;
+	if (skip > len * 0.5) skip = len * 0.5;
+	chromaGoertzelHann(a, t0 + skip, t1, out);
+}
+
+def chromaCosine(a: Array<float>, b: Array<float>) -> float {
+	var dot = 0.0f, na = 0.0f, nb = 0.0f;
+	for (i < 12) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+	if (na < 1e-12f || nb < 1e-12f) return 0.0f;
+	return dot / float.sqrt(na * nb);
+}
+
+//==========================================================================
+// Chord models (complete_algo.cpp)
+//==========================================================================
+def ROOT_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+
+def triadTemplate(root: int, minor: bool, v: Array<float>) {
+	for (i < 12) v[i] = 0.0f;
+	v[root] = 1.0f; v[(root + if(minor, 3, 4)) % 12] = 0.8f; v[(root + 7) % 12] = 0.8f;
+}
+
+// Parse a chord name's root and quality; returns (ok, root, minor).
+def parseChord(text: string) -> (bool, int, bool) {
+	if (text == null || text.length == 0) return (false, 0, false);
+	var r = -1;
+	match (text[0]) {
+		'C' => r = 0;
+		'D' => r = 2;
+		'E' => r = 4;
+		'F' => r = 5;
+		'G' => r = 7;
+		'A' => r = 9;
+		'B' => r = 11;
+		_ => return (false, 0, false);
+	}
+	var q = 1;
+	if (q < text.length && text[q] == '#') { r = (r + 1) % 12; q++; }
+	else if (q < text.length && text[q] == 'b') { r = (r + 11) % 12; q++; }
+	var minor = q < text.length && text[q] == 'm' && (q + 1 >= text.length || text[q + 1] != 'a');
+	return (true, r, minor);
+}
+
+def strEq(a: string, b: string) -> bool {
+	if (a.length != b.length) return false;
+	for (i < a.length) if (a[i] != b[i]) return false;
+	return true;
+}
+def firstWord(s: string) -> string {	// "Em Em" -> "Em"
+	for (i < s.length) if (s[i] == ' ') return Arrays.range(s, 0, i);
+	return s;
+}
+def chordName(root: int, minor: bool) -> string {
+	var r = ROOT_NAMES[root];
+	if (!minor) return r;
+	var s = Array<byte>.new(r.length + 1);
+	for (i < r.length) s[i] = r[i];
+	s[r.length] = 'm';
+	return s;
+}
+
+def firstBeatAt(beats: Array<double>, t: double) -> int {
+	var lo = 0, hi = beats.length;
+	while (lo < hi) { var m = (lo + hi) / 2; if (beats[m] < t) lo = m + 1; else hi = m; }
+	return lo;
+}
+def nearestBeat(beats: Array<double>, t: double) -> int {
+	var i = firstBeatAt(beats, t);
+	if (i >= beats.length) return beats.length - 1;
+	if (i > 0 && t - beats[i - 1] < beats[i] - t) return i - 1;
+	return i;
+}
+def chordsIn(cm: ChordMap, t0: double, t1: double) -> int {
+	var n = 0;
+	for (i < cm.count()) if (cm.tStart[i] >= t0 - 1e-3 && cm.tStart[i] < t1 - 1e-3) n++;
+	return n;
+}
+
+def buildChordModels(beats: Array<double>, cm: ChordMap, p: ChordParams, cache: Array<Array<float>>) -> Vector<ChordModel> {
+	var models = Vector<ChordModel>.new();
+	for (i < cm.count()) {
+		var bs = nearestBeat(beats, cm.tStart[i]), be = nearestBeat(beats, cm.tEnd[i]);
+		if (be <= bs) continue;
+		var name = firstWord(cm.text[i]);
+		var m: ChordModel;
+		for (j < models.length) if (strEq(models[j].text, name)) m = models[j];
+		if (m == null) {
+			m = ChordModel.new(name);
+			m.seen = true;
+			models.put(m);
+		}
+		for (k = bs; k < be && k < cache.length; k++) {
+			var e = cache[k];
+			for (c < 12) m.v[c] += e[c];
+			m.n++;
+		}
+	}
+	// Blend each learned model with its triad (k pseudo-beats of it)
+	var tri = Array<float>.new(12);
+	for (j < models.length) {
+		var m = models[j];
+		var pc = parseChord(m.text);
+		var mx = 0.0f;
+		for (c < 12) mx = DspMath.fmax(mx, m.v[c]);
+		var fn = float.!(m.n);
+		for (c < 12) {
+			var learned = if(mx > 0, m.v[c] / mx, 0.0f);
+			if (pc.0) {
+				triadTemplate(pc.1, pc.2, tri);
+				m.v[c] = (fn * learned + p.priorBeats * tri[c]) / (fn + p.priorBeats);
+			} else {
+				m.v[c] = learned;
+			}
+		}
+	}
+	// Unseen triads as a fallback vocabulary, penalised in the decoder
+	if (p.unseenPenalty < 1.0f) {
+		for (t < 24) {
+			var root = t % 12, minor = t >= 12;
+			var dup = false;
+			for (j < models.length) {
+				var pc = parseChord(models[j].text);
+				if (pc.0 && pc.1 == root && pc.2 == minor) dup = true;
+			}
+			if (dup) continue;
+			var x = ChordModel.new(chordName(root, minor));
+			x.seen = false;
+			triadTemplate(root, minor, x.v);
+			models.put(x);
+		}
+	}
+	return models;
+}
+
+// Corpus-trained emission model (chord_model.h): softmax over the 24 triads.
+def CHORD_MODEL_DIM = 24;
+def CHORD_MODEL_W = [
+	[5.0598f, -1.6120f, -0.9264f, -1.3713f, 1.2384f, -1.7080f, -0.6285f, 3.1141f, -1.8969f, -0.7722f, -0.5031f, 0.3978f, 3.9397f, -1.9579f, -0.0943f, -1.8920f, 0.5484f, -0.9240f, -0.8239f, 3.2379f, -2.1326f, -0.6638f, -0.3545f, 0.1813f],
+	[3.1931f, -0.6527f, -0.1028f, 0.8766f, -1.3981f, -1.7566f, -0.6940f, 2.6519f, -0.7209f, -0.8405f, -0.2178f, -0.7298f, 2.7248f, -0.4872f, 0.2485f, 0.9484f, -1.3160f, -1.1430f, -0.6171f, 2.3814f, -0.5142f, -0.6311f, -0.0523f, -0.6064f]
+];
+def CHORD_MODEL_B = [0.2289f, -0.2289f];
+
+def cpX = Array<float>.new(CHORD_MODEL_DIM);
+def cpS = Array<float>.new(24);
+def cpNa = Array<float>.new(12);
+def cpNb = Array<float>.new(12);
+def cpCtx = Array<float>.new(12);
+
+def putNorm(x: Array<float>, off: int, v: Array<float>) {
+	var n = 0.0;
+	for (k < 12) n += double.!(v[k]) * v[k];
+	var inv = if(n > 1e-12, float.roundd(1.0 / double.sqrt(n)), 0.0f);
+	for (k < 12) x[off + k] = v[k] * inv;
+}
+def corpusChordProbs(cache: Array<Array<float>>, bi: int, p24: Array<float>) {
+	var x = cpX;
+	putNorm(x, 0, cache[bi]);
+	// CHORD_MODEL_CONTEXT: neighbouring beats' mean chroma
+	var a = if(bi > 0, bi - 1, bi), b = if(bi + 1 < cache.length, bi + 1, bi);
+	putNorm(x, 0, cache[a]); for (k < 12) cpNa[k] = x[k];
+	putNorm(x, 0, cache[b]); for (k < 12) cpNb[k] = x[k];
+	for (k < 12) cpCtx[k] = 0.5f * (cpNa[k] + cpNb[k]);
+	putNorm(x, 0, cache[bi]);
+	for (k < 12) x[12 + k] = cpCtx[k];
+
+	var s = cpS, mx = -1e30f;
+	for (q < 2) {
+		var w = CHORD_MODEL_W[q];
+		for (r < 12) {
+			var v = CHORD_MODEL_B[q];
+			for (blk < CHORD_MODEL_DIM / 12) {
+				for (k < 12) v += w[blk * 12 + k] * x[blk * 12 + (k + r) % 12];
+			}
+			s[q * 12 + r] = v;
+			if (v > mx) mx = v;
+		}
+	}
+	var sum = 0.0;
+	for (c < 24) { p24[c] = DspMath.expf(s[c] - mx); sum += p24[c]; }
+	for (c < 24) p24[c] = float.roundd(p24[c] / sum);
+}
+
+def diatonic(tonic: int, key_minor: bool, root: int, minor: bool) -> bool {
+	var d = ((root - tonic) % 12 + 12) % 12;
+	if (!key_minor) return if(minor, d == 2 || d == 4 || d == 9, d == 0 || d == 5 || d == 7);
+	return if(minor, d == 0 || d == 5 || d == 7, d == 3 || d == 8 || d == 10 || d == 7);
+}
+
+def KS_MAJ = [6.35f, 2.23f, 3.48f, 2.33f, 4.38f, 4.09f, 2.52f, 5.19f, 2.39f, 3.66f, 2.29f, 2.88f];
+def KS_MIN = [6.33f, 2.68f, 3.52f, 5.38f, 2.60f, 3.53f, 2.54f, 4.75f, 3.98f, 2.69f, 3.34f, 3.17f];
+
+// Returns (ok, tonic, key_minor).
+def estimateKey(beats: Array<double>, cm: ChordMap, cache: Array<Array<float>>) -> (bool, int, bool) {
+	if (cm.count() >= 3) {
+		var best = -1.0, bt = 0, bmin = false;
+		for (k < 24) {
+			var t = k % 12, mi = k >= 12;
+			var cover = 0.0, tonic_w = 0.0;
+			for (i < cm.count()) {
+				var pc = parseChord(firstWord(cm.text[i]));
+				if (!pc.0) continue;
+				var bs = nearestBeat(beats, cm.tStart[i]), be = nearestBeat(beats, cm.tEnd[i]);
+				var w = if(be > bs, double.!(be - bs), 1.0);
+				if (diatonic(t, mi, pc.1, pc.2)) cover += w;
+				if (pc.1 == t && pc.2 == mi) tonic_w += w;
+			}
+			var sc = cover + 0.5 * tonic_w;
+			if (sc > best) { best = sc; bt = t; bmin = mi; }
+		}
+		if (best > 0) return (true, bt, bmin);
+	}
+	if (cache.length == 0) return (false, 0, false);
+	var mean = Array<double>.new(12);
+	for (e in cache) for (k < 12) mean[k] += e[k];
+	var best = -2.0, bt = 0, bmin = false;
+	for (k < 24) {
+		var prof = if(k >= 12, KS_MIN, KS_MAJ);
+		var t = k % 12;
+		var dot = 0.0, na = 0.0, nb = 0.0, ma = 0.0, mb = 0.0;
+		for (q < 12) { ma += mean[q] / 12; mb += prof[q] / 12.0; }
+		for (q < 12) {
+			var a = mean[(q + t) % 12] - ma, b = prof[q] - mb;
+			dot += a * b; na += a * a; nb += b * b;
+		}
+		var r = if(na > 0 && nb > 0, dot / double.sqrt(na * nb), -2.0);
+		if (r > best) { best = r; bt = t; bmin = k >= 12; }
+	}
+	if (best <= -2) return (false, 0, false);
+	return (true, bt, bmin);
+}
+
+// Viterbi decode over beat intervals [i0, i1).  Returns labels (model index,
+// or -1 for beats with no chroma) and the final best path score.
+def decodeChords(beats: Array<double>, cm: ChordMap, p: ChordParams, cache: Array<Array<float>>,
+		models: Array<ChordModel>, i0: int, i1: int, ts: int, measure_anchor: int,
+		out_label: Array<int>) -> float {
+	var n = i1 - i0, M = models.length;
+	for (i < n) out_label[i] = -1;
+	if (n <= 0 || M == 0) return 0.0f;
+	var em = Array<float>.new(n * M);
+	var cls = Array<int>.new(M);
+	for (m < M) cls[m] = -1;
+	var any_seen = false;
+	for (m < M) if (models[m].seen) any_seen = true;
+	var cw = if(any_seen, p.corpusWeight, p.corpusWeightCold);
+	if (cw > 0.0f) {
+		for (m < M) {
+			var pc = parseChord(models[m].text);
+			if (pc.0) cls[m] = pc.1 + if(pc.2, 12, 0);
+		}
+	}
+	// Key bonus for unseen triads in the key.
+	var keyb = Array<float>.new(M);
+	if (p.keyBonus > 0.0f) {
+		var key = estimateKey(beats, cm, cache);
+		if (key.0) {
+			for (m < M) {
+				var pc = parseChord(models[m].text);
+				if (!models[m].seen && pc.0 && diatonic(key.1, key.2, pc.1, pc.2)) keyb[m] = p.keyBonus;
+			}
+		}
+	}
+	var p24 = Array<float>.new(24);
+	for (i < n) {
+		var bi = i0 + i;
+		var v = if(bi < cache.length, cache[bi]);
+		if (cw > 0.0f && v != null) corpusChordProbs(cache, bi, p24);
+		for (m < M) {
+			var s = if(v != null, chromaCosine(v, models[m].v), 0.0f);
+			if (cw > 0.0f && v != null && cls[m] >= 0) s = (1.0f - cw) * s + cw * p24[cls[m]];
+			if (!models[m].seen) s -= p.unseenPenalty;
+			s += keyb[m];
+			em[i * M + m] = s;
+		}
+	}
+	var score = Array<float>.new(n * M);
+	var back = Array<int>.new(n * M);
+	for (i < score.length) { score[i] = -1e30f; back[i] = -1; }
+	for (m < M) score[m] = em[m];
+	for (i = 1; i < n; i++) {
+		var measure_start = ts > 0 && ((i0 + i - measure_anchor) % ts + ts) % ts == 0;
+		var change = p.transition * if(measure_start, (1.0f - p.measureBonus), 1.0f);
+		var bp = 0, bv = -1e30f;
+		var prev = (i - 1) * M, cur = i * M;
+		for (m < M) if (score[prev + m] > bv) { bv = score[prev + m]; bp = m; }
+		for (m < M) {
+			var stay = score[prev + m];
+			var sw = bv - change;
+			if (stay >= sw) { score[cur + m] = stay + em[cur + m]; back[cur + m] = m; }
+			else { score[cur + m] = sw + em[cur + m]; back[cur + m] = bp; }
+		}
+	}
+	var best = 0, bv = -1e30f;
+	var last = (n - 1) * M;
+	for (m < M) if (score[last + m] > bv) { bv = score[last + m]; best = m; }
+	for (i = n - 1; i >= 0; i--) {
+		out_label[i] = best;
+		best = back[i * M + best];
+		if (best < 0) best = 0;
+	}
+	return bv;
+}
+
+//==========================================================================
+// Driver
+//==========================================================================
+class DecodeRun(name: string) {
+	var models: Array<ChordModel>;
+	var params: ChordParams;
+	var cm: ChordMap;
+	var i0: int;
+	var i1: int;
+	var labels: Array<int>;		// first (unshifted) decode
+	var scoreSum = 0.0;
+	var labelHash = 0;
+	var decodedBeats = 0;
+}
+
+def runReps(r: DecodeRun, beats: Array<double>, cache: Array<Array<float>>, reps: int) {
+	var tmp = Array<int>.new(r.i1 - r.i0);
+	var shifts = DspMath.imax(1, DspMath.imin(16, (r.i1 - r.i0) / 2));
+	for (rep < reps) {
+		var start = r.i0 + rep % shifts;
+		var sc = decodeChords(beats, r.cm, r.params, cache, r.models, start, r.i1, 4, 0, tmp);
+		r.scoreSum += sc;
+		for (i < r.i1 - start) r.labelHash = r.labelHash * 31 + tmp[i];
+		r.decodedBeats += r.i1 - start;
+		if (rep == 0) r.labels = Arrays.dup(tmp);
+	}
+}
+
+def report(r: DecodeRun, cache: Array<Array<float>>, truth: Array<int>) -> int {
+	var n = r.i1 - r.i0, correct = 0;
+	for (i < n) {
+		var pc = parseChord(r.models[r.labels[i]].text);
+		if (pc.0 && pc.1 + if(pc.2, 12, 0) == truth[r.i0 + i]) correct++;
+	}
+	var mv = Array<float>.new(r.models.length * 12);
+	for (m < r.models.length) for (c < 12) mv[m * 12 + c] = r.models[m].v[c];
+	System.puts(r.name); System.puts(": models="); System.puti(r.models.length);
+	System.puts(" beats="); System.puti(r.i0); System.puts(".."); System.puti(r.i1);
+	System.puts(" correct="); System.puti(correct); System.puts("/"); System.puti(n);
+	System.ln();
+	System.puts("  models: "); System.puti(DspOut.checksum(mv, 0, mv.length));
+	System.puts(" transition="); DspOut.putf(r.params.transition, 4);
+	System.puts(" decoded="); System.puti(r.decodedBeats);
+	System.ln();
+	System.puts("  score sum: "); DspOut.putd(r.scoreSum, 3);
+	System.puts(" path hash: "); System.puti(r.labelHash);
+	System.ln();
+	// The chart: runs of equal labels
+	System.puts("  chart:");
+	var k = 0, runs = 0;
+	while (k < n) {
+		var e = k;
+		while (e < n && r.labels[e] == r.labels[k]) e++;
+		if (runs < 12) { System.putc(' '); System.puts(r.models[r.labels[k]].text); System.putc('/'); System.puti(e - k); }
+		runs++;
+		k = e;
+	}
+	System.puts(" ("); System.puti(runs); System.puts(" runs)");
+	System.ln();
+	return correct;
+}
+
+def main(args: Array<string>) -> int {
+	// args: <clip.wav> <seconds of song> <decode repetitions> [t: print timing]
+	if (args.length < 3) {
+		System.puts("Usage: ChordDecode <clip.wav> <seconds> <reps> [t]\n");
+		return 1;
+	}
+	var reps = Int.parse(args[2]);
+	var timing = args.length > 3;
+	var tl = System.ticksUs();
+	var song = SynthSong.new();
+	song.seconds = Int.parse(args[1]);
+	// The clip's parameters (inputs/songs.list): 240 bpm, two beats per chord.
+	song.bpm = 240;
+	song.beatsPerChord = 2;
+	song.seed = 4242;
+	song.roots = [0, 9, 5, 7, 2, 4];			// C Am F G Dm Em
+	song.minors = [false, true, false, false, true, true];
+	song.loadTiled(args[0]);
+	var a = AudioPcm.new(song.pcm, song.frames, song.channels, song.sampleRate);
+	var beats = song.beatTimes, nb = beats.length, n_int = nb - 1;
+	var bpc = song.beatsPerChord;
+
+	// --- Beat-synchronous chroma ---
+	var t0 = System.ticksUs();
+	var cache = Array<Array<float>>.new(n_int);
+	for (i < n_int) {
+		cache[i] = Array<float>.new(12);
+		beatChromaInterval(a, beats[i], beats[i + 1], cache[i]);
+	}
+	var t1 = System.ticksUs();
+
+	// --- Mapped chords: up to two cycles of the progression, at most half the beats ---
+	var mapped = DspMath.imin(2 * song.roots.length, (n_int + bpc) / (2 * bpc));
+	var cs = Array<double>.new(mapped), ce = Array<double>.new(mapped), ct = Array<string>.new(mapped);
+	for (c < mapped) {
+		var b = c * bpc, ch = song.chordAt[b];
+		cs[c] = beats[b]; ce[c] = beats[b + bpc];
+		ct[c] = chordName(ch % 12, ch >= 12);
+	}
+	var cm = ChordMap.new(cs, ce, ct);
+	var p = ChordParams.new();
+
+	// warm: models learned from the map, decode the chord-free stretch
+	var warm = DecodeRun.new("warm");
+	warm.cm = cm;
+	warm.models = buildChordModels(beats, cm, p, cache).extract();
+	warm.params = p.copy();
+	if (p.learnRate && cm.count() >= 3) {
+		var lens = Vector<int>.new();
+		for (i < cm.count()) {
+			var bs = nearestBeat(beats, cm.tStart[i]), be = nearestBeat(beats, cm.tEnd[i]);
+			if (be > bs) lens.put(be - bs);
+		}
+		if (lens.length > 0) {
+			var la = lens.extract();
+			for (i = 1; i < la.length; i++) {
+				var v = la[i], j = i - 1;
+				while (j >= 0 && la[j] > v) { la[j + 1] = la[j]; j--; }
+				la[j + 1] = v;
+			}
+			var med = double.!(la[la.length / 2]);
+			warm.params.transition = p.transition * float.roundd(med / 4.0);
+		}
+	}
+	// chord-free intervals (no chord starts in it, not inside a mapped span)
+	var first_free = n_int;
+	for (i < n_int) {
+		var b0 = beats[i], b1 = beats[i + 1];
+		if (chordsIn(cm, b0, b1) > 0) continue;
+		var clash = false;
+		for (c < cm.count()) if (cm.tStart[c] < b0 + 1e-3 && cm.tEnd[c] > b0 + 1e-3) clash = true;
+		if (!clash) { first_free = i; break; }
+	}
+	warm.i0 = first_free; warm.i1 = n_int;
+
+	// cold: no map at all
+	var cold = DecodeRun.new("cold");
+	var empty = ChordMap.new([], [], []);
+	cold.cm = empty;
+	cold.models = buildChordModels(beats, empty, p, cache).extract();
+	cold.params = p.copy();
+	cold.i0 = 0; cold.i1 = n_int;
+
+	runReps(warm, beats, cache, reps);
+	runReps(cold, beats, cache, reps);
+	var t2 = System.ticksUs();
+
+	// --- Report ---
+	DspOut.label("beats"); System.puti(nb); System.ln();
+	DspOut.label("mapped chords"); System.puti(mapped); System.ln();
+	var flat = Array<float>.new(n_int * 12);
+	var csum = 0.0;
+	for (i < n_int) for (c < 12) { flat[i * 12 + c] = cache[i][c]; csum += cache[i][c]; }
+	DspOut.label("chroma"); System.puti(DspOut.checksum(flat, 0, flat.length)); System.ln();
+	DspOut.label("chroma sum"); DspOut.putd(csum, 3); System.ln();
+	var key = estimateKey(beats, empty, cache);
+	DspOut.label("key (KS)"); System.puts(chordName(key.1, key.2)); System.ln();
+	var wc = report(warm, cache, song.chordAt);
+	var cc = report(cold, cache, song.chordAt);
+	if (timing) {
+		var tc = t1 - t0, td = t2 - t1;
+		System.puts("time(us): load="); System.puti(t0 - tl); System.puts(" chroma="); System.puti(tc);
+		System.puts(" decode="); System.puti(td); System.puts(" (decode share ");
+		System.puti(if(tc + td > 0, 100 * td / (tc + td), 0)); System.puts("%)\n");
+	}
+	// --- Checks ---
+	var ok = true;
+	var learned = false;
+	for (m in warm.models) if (m.seen) learned = true;
+	ok &= checkBool("warm models learned from mapped chords", mapped > 0 && learned);
+	ok &= checkBool("key estimate (Krumhansl-Schmuckler) is C major", key.0 && key.1 == 0 && !key.2);
+	ok &= check("warm decode accuracy >= 95%", wc, warm.i1 - warm.i0, 95);
+	ok &= check("cold decode accuracy >= 90%", cc, cold.i1 - cold.i0, 90);
+	return if(ok, 0, 1);
+}
+def check(what: string, num: int, den: int, pct: int) -> bool {
+	var pass = den > 0 && num * 100 >= pct * den;
+	System.puts("check "); System.puts(what); System.puts(" ("); System.puti(num);
+	System.puts("/"); System.puti(den); System.puts("): ");
+	System.puts(if(pass, "PASS\n", "FAIL\n"));
+	return pass;
+}
+def checkBool(what: string, pass: bool) -> bool {
+	System.puts("check "); System.puts(what); System.puts(": ");
+	System.puts(if(pass, "PASS\n", "FAIL\n"));
+	return pass;
+}

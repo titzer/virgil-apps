@@ -1,0 +1,77 @@
+// Copyright 2026 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Iterative radix-2 Cooley-Tukey FFT on separate re/im float arrays,
+// with precomputed twiddles and bit-reversal table (as in beatmapper's stretch.cpp).
+class Fft(n: int) {
+	def cosT = Array<float>.new(n / 2);
+	def sinT = Array<float>.new(n / 2);
+	def rev = Array<int>.new(n);
+
+	new() {
+		for (k < n / 2) {
+			var a = -DspMath.TWO_PI * k / n;
+			cosT[k] = float.roundd(DspMath.cos(a));
+			sinT[k] = float.roundd(DspMath.sin(a));
+		}
+		var bits = 0;
+		while ((1 << byte.!(bits)) < n) bits++;
+		for (i < n) {
+			var r = 0;
+			for (b < bits) if ((i & (1 << byte.!(b))) != 0) r |= 1 << byte.!(bits - 1 - b);
+			rev[i] = r;
+		}
+	}
+	// In-place forward transform.
+	def run(re: Array<float>, im: Array<float>) {
+		for (i < n) {
+			var j = rev[i];
+			if (i < j) {
+				var t = re[i]; re[i] = re[j]; re[j] = t;
+				t = im[i]; im[i] = im[j]; im[j] = t;
+			}
+		}
+		for (len = 2; len <= n; len <<= 1) {
+			var half = len >> 1, step = n / len;
+			for (i = 0; i < n; i += len) {
+				for (j < half) {
+					var wr = cosT[j * step], wi = sinT[j * step];
+					var a = i + j, b = a + half;
+					var vr = re[b] * wr - im[b] * wi;
+					var vi = re[b] * wi + im[b] * wr;
+					re[b] = re[a] - vr; im[b] = im[a] - vi;
+					re[a] = re[a] + vr; im[a] = im[a] + vi;
+				}
+			}
+		}
+	}
+	// In-place inverse transform (scaled by 1/n).
+	def inverse(re: Array<float>, im: Array<float>) {
+		for (i < n) im[i] = -im[i];
+		run(re, im);
+		var s = 1.0f / float.roundd(n);
+		for (i < n) { re[i] *= s; im[i] = -im[i] * s; }
+	}
+}
+
+// Window functions.
+component Windows {
+	def hann(n: int) -> Array<float> {
+		var w = Array<float>.new(n);
+		for (i < n) w[i] = float.roundd(0.5 - 0.5 * DspMath.cos(DspMath.TWO_PI * i / n));
+		return w;
+	}
+	def hannSymmetric(n: int) -> Array<float> {
+		var w = Array<float>.new(n);
+		for (i < n) w[i] = float.roundd(0.5 - 0.5 * DspMath.cos(DspMath.TWO_PI * i / (n - 1)));
+		return w;
+	}
+	def blackman(n: int) -> Array<float> {
+		var w = Array<float>.new(n);
+		for (i < n) {
+			var x = DspMath.TWO_PI * i / (n - 1);
+			w[i] = float.roundd(0.42 - 0.5 * DspMath.cos(x) + 0.08 * DspMath.cos(2 * x));
+		}
+		return w;
+	}
+}

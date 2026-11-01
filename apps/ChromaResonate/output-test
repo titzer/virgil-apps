@@ -1,0 +1,11 @@
+0 C: C/C
+1 C: C/C
+2 C: C/C
+3 C: C/C
+4 Am: A/Am
+5 Am: A/Am
+6 Am: A/Am
+7 Am: A/Am
+resonate: root 16/16 triad 16/16 cos 0.907 checksum 802750373
+check resonate root accuracy >= 95%: PASS (16/16)
+check resonate triad accuracy >= 95%: PASS (16/16)

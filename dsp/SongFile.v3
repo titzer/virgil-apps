@@ -1,0 +1,68 @@
+// Copyright 2026 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Minimal 16-bit PCM WAV reader/writer for the DSP benchmark inputs.
+// Samples are stored as round(clamp(x, -1, 1) * 32767) (half-to-even) and
+// read back as s / 32768f, identically in dsp/ref/song_file.h.
+class SongClip(sampleRate: int, channels: int, frames: int, pcm: Array<float>) { }
+
+component SongFile {
+	def read(path: string) -> SongClip {
+		var d = System.fileLoad(path);
+		if (d == null || d.length < 12) return null;
+		if (d[0] != 'R' || d[1] != 'I' || d[2] != 'F' || d[3] != 'F') return null;
+		var pos = 12, sr = 0, ch = 0, bits = 0;
+		while (pos + 8 <= d.length) {
+			var id0 = d[pos], id1 = d[pos + 1], id2 = d[pos + 2], id3 = d[pos + 3];
+			var len = u32le(d, pos + 4);
+			var body = pos + 8;
+			if (id0 == 'f' && id1 == 'm' && id2 == 't' && id3 == ' ') {
+				ch = u16le(d, body + 2);
+				sr = u32le(d, body + 4);
+				bits = u16le(d, body + 14);
+			} else if (id0 == 'd' && id1 == 'a' && id2 == 't' && id3 == 'a') {
+				if (bits != 16 || ch == 0) return null;
+				var n = len / 2;
+				if (body + n * 2 > d.length) n = (d.length - body) / 2;
+				var frames = n / ch;
+				var pcm = Array<float>.new(frames * ch);
+				for (i < pcm.length) {
+					var v = u16le(d, body + 2 * i);
+					if (v >= 32768) v -= 65536;
+					pcm[i] = float.!(v) / 32768.0f;
+				}
+				return SongClip.new(sr, ch, frames, pcm);
+			}
+			pos = body + len + (len & 1);
+		}
+		return null;
+	}
+	def write(path: string, sampleRate: int, channels: int, pcm: Array<float>) -> bool {
+		var dataLen = pcm.length * 2;
+		var d = Array<byte>.new(44 + dataLen);
+		put4(d, 0, 'R', 'I', 'F', 'F'); putU32(d, 4, 36 + dataLen); put4(d, 8, 'W', 'A', 'V', 'E');
+		put4(d, 12, 'f', 'm', 't', ' '); putU32(d, 16, 16);
+		putU16(d, 20, 1); putU16(d, 22, channels); putU32(d, 24, sampleRate);
+		putU32(d, 28, sampleRate * channels * 2); putU16(d, 32, channels * 2); putU16(d, 34, 16);
+		put4(d, 36, 'd', 'a', 't', 'a'); putU32(d, 40, dataLen);
+		for (i < pcm.length) {
+			var x = double.!(pcm[i]);
+			if (x > 1.0) x = 1.0;
+			if (x < -1.0) x = -1.0;
+			var q = int.truncd(double.round(x * 32767.0));
+			putU16(d, 44 + 2 * i, q & 0xFFFF);
+		}
+		var fd = System.fileOpen(path, false);
+		if (fd < 0) return false;
+		System.fileWriteK(fd, d, 0, d.length);
+		System.fileClose(fd);
+		return true;
+	}
+	private def u16le(d: Array<byte>, p: int) -> int { return int.!(d[p]) | (int.!(d[p + 1]) << 8); }
+	private def u32le(d: Array<byte>, p: int) -> int {
+		return int.!(d[p]) | (int.!(d[p + 1]) << 8) | (int.!(d[p + 2]) << 16) | (int.!(d[p + 3]) << 24);
+	}
+	private def put4(d: Array<byte>, p: int, a: byte, b: byte, c: byte, e: byte) { d[p] = a; d[p + 1] = b; d[p + 2] = c; d[p + 3] = e; }
+	private def putU16(d: Array<byte>, p: int, v: int) { d[p] = byte.view(v); d[p + 1] = byte.view(v >> 8); }
+	private def putU32(d: Array<byte>, p: int, v: int) { putU16(d, p, v); putU16(d, p + 2, v >> 16); }
+}

@@ -1,0 +1,61 @@
+// Copyright 2026 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Generates a synthetic song clip (dsp/Synth.v3) and writes it as a 16-bit WAV.
+// Usage: GenSong <out.wav> [key=value ...]   (all values are integers)
+//   seconds=10 sr=22050 ch=2 bpm=120 a4x10=4400 seed=12345 bpc=4
+//   roots=0,9,5,7 minors=0,1,0,0
+// Build: bin/gen-songs.bash (regenerates every checked-in clip in inputs/).
+def main(args: Array<string>) -> int {
+	if (args.length < 1) { System.puts("Usage: GenSong <out.wav> [key=value ...]\n"); return 1; }
+	var s = SynthSong.new();
+	for (i = 1; i < args.length; i++) {
+		var a = args[i], pos = -1;
+		for (j < a.length) if (a[j] == '=') { pos = j; break; }
+		if (pos < 0) { System.puts("bad arg\n"); return 1; }
+		var key = slice(a, 0, pos), val = slice(a, pos + 1, a.length);
+		var ints = parseInts(val);
+		if (eq(key, "seconds")) s.seconds = ints[0];
+		else if (eq(key, "sr")) s.sampleRate = ints[0];
+		else if (eq(key, "ch")) s.channels = ints[0];
+		else if (eq(key, "bpm")) s.bpm = ints[0];
+		else if (eq(key, "a4x10")) s.a4 = double.!(ints[0]) / 10.0;
+		else if (eq(key, "seed")) s.seed = u32.view(ints[0]);
+		else if (eq(key, "bpc")) s.beatsPerChord = ints[0];
+		else if (eq(key, "roots")) s.roots = ints;
+		else if (eq(key, "minors")) s.minors = toBools(ints);
+		else { System.puts("unknown key: "); System.puts(key); System.ln(); return 1; }
+	}
+	s.generate();
+	if (!SongFile.write(args[0], s.sampleRate, s.channels, s.pcm)) { System.puts("write failed\n"); return 1; }
+	System.puts(args[0]); System.puts(": "); System.puti(s.frames); System.puts(" frames, ");
+	System.puti(s.beatTimes.length); System.puts(" beats\n");
+	return 0;
+}
+def toBools(a: Array<int>) -> Array<bool> {
+	var r = Array<bool>.new(a.length);
+	for (i < a.length) r[i] = a[i] != 0;
+	return r;
+}
+def slice(a: string, s: int, e: int) -> string {
+	var r = Array<byte>.new(e - s);
+	for (i < r.length) r[i] = a[s + i];
+	return r;
+}
+def eq(a: string, b: string) -> bool {
+	if (a.length != b.length) return false;
+	for (i < a.length) if (a[i] != b[i]) return false;
+	return true;
+}
+def parseInts(s: string) -> Array<int> {
+	var count = 1;
+	for (c in s) if (c == ',') count++;
+	var r = Array<int>.new(count), k = 0, v = 0, neg = false;
+	for (c in s) {
+		if (c == ',') { r[k++] = if(neg, -v, v); v = 0; neg = false; }
+		else if (c == '-') neg = true;
+		else v = v * 10 + (c - '0');
+	}
+	r[k] = if(neg, -v, v);
+	return r;
+}

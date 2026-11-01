@@ -1,0 +1,223 @@
+// Copyright 2026 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Deterministic synthetic "song" generator used as input to the beatmapper
+// DSP benchmarks (no audio files needed).  Produces stereo-interleaved f32
+// PCM with a drum pattern (kick/snare/hat) at a fixed tempo over a cyclic
+// chord progression (major/minor triads with harmonics, a bass note), with
+// an optional global tuning offset (A4 != 440 Hz) and a little noise.
+class SynthSong {
+	var sampleRate = 22050;
+	var channels = 2;
+	var bpm = 120.0;
+	var seconds = 10.0;
+	var a4 = 440.0;	 	// tuning reference
+	var beatsPerChord = 4;
+	// Chord progression as (root pitch class 0=C..11=B, minor?)
+	var roots = [0, 9, 5, 7];	// C Am F G
+	var minors = [false, true, false, false];
+	var seed = 12345u;
+
+	// Outputs
+	var pcm: Array<float>;		// interleaved, frames * channels
+	var frames: int;
+	var beatTimes: Array<double>;	// ground-truth beat times (seconds)
+	var chordAt: Array<int>;	// ground-truth chord per beat: root + (minor ? 12 : 0)
+
+	def rand() -> float {
+		seed = seed * 1664525u + 1013904223u;
+		return float.roundd(seed >> 8) / 16777216.0f * 2.0f - 1.0f;
+	}
+	def midiFreq(midi: double) -> double {
+		return a4 * DspMath.pow(2.0, (midi - 69.0) / 12.0);
+	}
+	// Compute frames and the ground truth (beatTimes, chordAt) without synthesizing audio (layout only).
+	def computeTruth() -> this {
+		frames = int.truncd(seconds * sampleRate);
+		var period = 60.0 / bpm;
+		var nbeats = int.truncd(seconds / period);
+		beatTimes = Array<double>.new(nbeats);
+		chordAt = Array<int>.new(nbeats);
+		for (b < nbeats) {
+			beatTimes[b] = b * period;
+			var ci = (b / beatsPerChord) % roots.length;
+			chordAt[b] = roots[ci] + if(minors[ci], 12, 0);
+		}
+	}
+	// Load a pre-generated clip (a 16-bit WAV written by dsp/gen/GenSong.v3 with this
+	// song's parameters) and tile it to {seconds}.  Ground truth is the clip's truth
+	// repeated at clip-length offsets.  Much cheaper than generate() at run time.
+	def loadTiled(path: string) -> this {
+		var clip = SongFile.read(path);
+		if (clip == null) System.error("SongFile", "cannot read input file");
+		if (clip.sampleRate != sampleRate || clip.channels != channels) System.error("SongFile", "sample rate / channels mismatch with song parameters");
+		var want = seconds;
+		var cf = clip.frames, ch = channels;
+		var clipSec = double.!(cf) / sampleRate;
+		seconds = clipSec;
+		computeTruth();
+		var cb = beatTimes, cc = chordAt;
+		seconds = want;
+		frames = int.truncd(want * sampleRate);
+		pcm = Array<float>.new(frames * ch);
+		var n = cf * ch, j = 0;
+		for (i < pcm.length) {
+			pcm[i] = clip.pcm[j];
+			if (++j == n) j = 0;
+		}
+		// replicate truth
+		var count = 0;
+		for (k = 0; k * clipSec < want; k++) for (b < cb.length) if (k * clipSec + cb[b] < want) count++;
+		beatTimes = Array<double>.new(count);
+		chordAt = Array<int>.new(count);
+		var x = 0;
+		for (k = 0; k * clipSec < want; k++) {
+			for (b < cb.length) {
+				var t = k * clipSec + cb[b];
+				if (t < want) { beatTimes[x] = t; chordAt[x] = cc[b]; x++; }
+			}
+		}
+	}
+	def generate() -> this {
+		frames = int.truncd(seconds * sampleRate);
+		var mono = Array<float>.new(frames);
+		var period = 60.0 / bpm;
+		var nbeats = int.truncd(seconds / period);
+		beatTimes = Array<double>.new(nbeats);
+		chordAt = Array<int>.new(nbeats);
+		var sr = double.!(sampleRate);
+
+		// --- harmonic content: chord tones + bass, per beat ---
+		for (b < nbeats) {
+			var t0 = b * period;
+			beatTimes[b] = t0;
+			var ci = (b / beatsPerChord) % roots.length;
+			var root = roots[ci], minor = minors[ci];
+			chordAt[b] = root + if(minor, 12, 0);
+			var s0 = int.truncd(t0 * sr), s1 = DspMath.imin(frames, int.truncd((t0 + period) * sr));
+			// triad in octave 4 (midi 60..71) + bass in octave 2
+			var notes = [60 + root, 60 + root + if(minor, 3, 4), 60 + root + 7, 36 + root];
+			var amps = [0.10, 0.08, 0.08, 0.14];
+			// per-sample envelope, shared by all partials (same arithmetic as inline)
+			var envs = Array<double>.new(DspMath.imax(0, s1 - s0));
+			for (s = s0; s < s1; s++) envs[s - s0] = 1.0 - 0.4 * double.!(s - s0) / double.!(s1 - s0 + 1);
+			for (n < notes.length) {
+				var f = midiFreq(notes[n]);
+				var w = DspMath.TWO_PI * f / sr;
+				// harmonics 1..4 via a sine recurrence (cheap and deterministic)
+				for (h = 1; h <= 4; h++) {
+					var wh = w * h;
+					if (wh >= DspMath.PI) break;
+					var amp = amps[n] / h;
+					var s1r = DspMath.sin(wh * s0), s2r = DspMath.sin(wh * (s0 - 1));
+					var c2 = 2.0 * DspMath.cos(wh);
+					for (s = s0; s < s1; s++) {
+						mono[s] += float.roundd(amp * envs[s - s0] * s1r);
+						var nx = c2 * s1r - s2r;
+						s2r = s1r; s1r = nx;
+					}
+				}
+			}
+		}
+		// --- drums ---
+		var half = period / 2;
+		var nhalf = int.truncd(seconds / half);
+		for (k < nhalf) {
+			var t = k * half;
+			var s0 = int.truncd(t * sr);
+			var beat = k / 2, onBeat = (k % 2) == 0;
+			if (onBeat && (beat % 2) == 0) kick(mono, s0, sr);
+			if (onBeat && (beat % 2) == 1) snare(mono, s0, sr);
+			hat(mono, s0, sr, if(onBeat, 0.12f, 0.07f));
+		}
+		// --- noise floor + stereo spread ---
+		pcm = Array<float>.new(frames * channels);
+		for (i < frames) {
+			var v = mono[i] + 0.002f * rand();
+			if (channels == 1) {
+				pcm[i] = v;
+			} else {
+				pcm[i * channels] = v * 0.9f;
+				pcm[i * channels + 1] = v * 0.8f + 0.001f * rand();
+			}
+		}
+	}
+	def kick(out: Array<float>, s0: int, sr: double) {
+		var len = int.truncd(0.15 * sr), ph = 0.0;
+		for (i < len) {
+			var s = s0 + i;
+			if (s >= out.length) break;
+			var t = i / sr;
+			var f = 50.0 + 100.0 * DspMath.exp(-t * 30.0);
+			ph += DspMath.TWO_PI * f / sr;
+			out[s] += float.roundd(0.6 * DspMath.exp(-t * 18.0) * DspMath.sin(ph));
+		}
+	}
+	def snare(out: Array<float>, s0: int, sr: double) {
+		var len = int.truncd(0.12 * sr);
+		for (i < len) {
+			var s = s0 + i;
+			if (s >= out.length) break;
+			var t = i / sr;
+			var env = DspMath.exp(-t * 25.0);
+			out[s] += float.roundd(env * (0.25 * rand() + 0.15 * DspMath.sin(DspMath.TWO_PI * 190.0 * t)));
+		}
+	}
+	def hat(out: Array<float>, s0: int, sr: double, amp: float) {
+		var len = int.truncd(0.04 * sr), prev = 0.0f;
+		for (i < len) {
+			var s = s0 + i;
+			if (s >= out.length) break;
+			var t = i / sr;
+			var n = rand();
+			var hp = n - prev;	// crude high-pass
+			prev = n;
+			out[s] += amp * float.roundd(DspMath.exp(-t * 90.0)) * hp;
+		}
+	}
+	// Mono mixdown (average of channels).
+	def mono() -> Array<float> {
+		var m = Array<float>.new(frames);
+		for (i < frames) {
+			var sum = 0.0f;
+			for (c < channels) sum += pcm[i * channels + c];
+			m[i] = sum / float.roundd(channels);
+		}
+		return m;
+	}
+}
+
+// Output helpers shared by the DSP benchmarks.
+component DspOut {
+	// Print {v} with {digits} fractional digits (rounded), no exponent.
+	def putd(v: double, digits: int) {
+		if (v != v) return System.puts("NaN");
+		if (v < 0) { System.putc('-'); v = -v; }
+		var scale = 1.0;
+		for (i < digits) scale *= 10.0;
+		var x = long.truncd(double.round(v * scale));
+		var ip = x / long.truncd(scale), fp = x % long.truncd(scale);
+		putl(ip);
+		if (digits > 0) {
+			System.putc('.');
+			var div = long.truncd(scale) / 10;
+			while (div > 0) { System.putc(byte.!('0' + (fp / div) % 10)); div /= 10; }
+		}
+	}
+	def putl(v: long) {
+		if (v < 0) { System.putc('-'); v = -v; }
+		if (v >= 10) putl(v / 10);
+		System.putc(byte.!('0' + v % 10));
+	}
+	def putf(v: float, digits: int) { putd(v, digits); }
+	// Order-sensitive checksum over floats quantized to 1e-4 (robust to last-bit noise).
+	def checksum(a: Array<float>, start: int, len: int) -> int {
+		var h = 0;
+		for (i = start; i < start + len; i++) {
+			var q = int.truncd(double.round(a[i] * 10000.0));
+			h = h * 31 + q;
+		}
+		return h;
+	}
+	def label(s: string) { System.puts(s); System.puts(": "); }
+}
